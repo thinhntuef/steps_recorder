@@ -52,13 +52,16 @@ class SettingsDialog(tk.Toplevel):
         self.var_vision = tk.BooleanVar(value=config.use_vision)
         self.var_merge = tk.BooleanVar(value=config.ai_merge_steps)
         self.var_preset = tk.StringVar(value=config.preset)
+        self.var_timeout = tk.StringVar(value=str(config.request_timeout))
 
         e_base = _style_entry(tk.Entry(frm, textvariable=self.var_base, width=46))
         e_model = _style_entry(tk.Entry(frm, textvariable=self.var_model, width=46))
         e_key = _style_entry(tk.Entry(frm, textvariable=self.var_key, show="*", width=46))
+        e_timeout = _style_entry(tk.Entry(frm, textvariable=self.var_timeout, width=46))
         row(0, "Base URL", e_base)
         row(1, "Model", e_model)
         row(2, "API Key", e_key)
+        row(3, "Timeout (giây)", e_timeout)
 
         card2, frm2 = _section_card(wrap, "Biên soạn tài liệu")
         card2.pack(fill="x", pady=(0, 10))
@@ -121,6 +124,10 @@ class SettingsDialog(tk.Toplevel):
         c.ai_merge_steps = bool(self.var_merge.get())
         c.preset = self.var_preset.get()
         c.custom_prompt = self.txt_prompt.get("1.0", "end").strip()
+        try:
+            c.request_timeout = max(30, int(self.var_timeout.get().strip()))
+        except ValueError:
+            c.request_timeout = 600
 
     def _load_form_from_config(self):
         c = self.config_obj
@@ -131,6 +138,7 @@ class SettingsDialog(tk.Toplevel):
         self.var_vision.set(bool(c.use_vision))
         self.var_merge.set(bool(c.ai_merge_steps))
         self.var_preset.set(c.preset if c.preset in PRESETS else "Hướng dẫn sử dụng")
+        self.var_timeout.set(str(c.request_timeout))
         self.txt_prompt.delete("1.0", "end")
         self.txt_prompt.insert("1.0", c.custom_prompt or "")
 

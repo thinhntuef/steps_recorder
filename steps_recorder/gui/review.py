@@ -471,10 +471,17 @@ class ReviewWindow(tk.Toplevel):
         title = self.rec.report_title
         summary = self.rec.report_summary
 
+        def progress(round_no, max_rounds):
+            # chạy trên luồng worker -> chuyển về luồng Tk
+            msg = (f"🎨 AI đang thiết kế trang HTML… "
+                   f"(lượt {round_no}/{max_rounds})")
+            self.after(0, lambda: self.status.set(msg))
+
         def worker():
             try:
                 html = call_ai_html(cfg, steps_snapshot,
-                                    title=title, summary=summary)
+                                    title=title, summary=summary,
+                                    on_progress=progress)
                 self.after(0, lambda: self._ai_html_done(html))
             except Exception as e:
                 self.after(0, lambda err=e: self._ai_error(err))

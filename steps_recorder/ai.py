@@ -134,8 +134,21 @@ def build_ai_messages(steps: List[Step], cfg: AppConfig) -> list:
     ]
 
 
-def _chat_completion(cfg: AppConfig, messages: list, use_response_format: bool,
-                     max_tokens: int = 4096) -> str:
+def _request_timeout(cfg: AppConfig) -> int:
+    try:
+        t = int(cfg.request_timeout)
+    except (TypeError, ValueError):
+        t = 600
+    return max(30, t)
+
+
+def _chat_completion_meta(cfg: AppConfig, messages: list, use_response_format: bool,
+                          max_tokens: int = 4096) -> tuple:
+    """Gọi API, trả về (nội dung, finish_reason).
+
+    finish_reason == "length" nghĩa là phản hồi bị cắt vì chạm max_tokens —
+    tín hiệu để vòng lặp tiếp nối yêu cầu AI viết tiếp.
+    """
     url = cfg.base_url.rstrip("/") + "/chat/completions"
     # temperature thấp + max_tokens rộng: phù hợp biên soạn tài liệu qua vLLM
     payload = {
@@ -152,10 +165,29 @@ def _chat_completion(cfg: AppConfig, messages: list, use_response_format: bool,
     # vLLM thường chấp nhận key bất kỳ; vẫn gửi header cho endpoint tương thích OpenAI
     key = (cfg.api_key or "").strip() or "EMPTY"
     req.add_header("Authorization", f"Bearer {key}")
-    with urllib.request.urlopen(req, timeout=300) as resp:
-        raw = resp.read().decode("utf-8")
+    timeout = _request_timeout(cfg)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8")
+    except TimeoutError:
+        raise RuntimeError(
+            f"Hết thời gian chờ AI ({timeout}s). Tăng 'Timeout (giây)' trong "
+            "⚙ Cấu hình, hoặc dùng model nhanh hơn / tắt gửi ảnh (vision).")
+    except urllib.error.URLError as e:
+        if isinstance(getattr(e, "reason", None), TimeoutError):
+            raise RuntimeError(
+                f"Hết thời gian chờ AI ({timeout}s). Tăng 'Timeout (giây)' trong "
+                "⚙ Cấu hình, hoặc dùng model nhanh hơn / tắt gửi ảnh (vision).")
+        raise
     obj = json.loads(raw)
-    return obj["choices"][0]["message"]["content"]
+    choice = obj["choices"][0]
+    return choice["message"]["content"], (choice.get("finish_reason") or "")
+
+
+def _chat_completion(cfg: AppConfig, messages: list, use_response_format: bool,
+                     max_tokens: int = 4096) -> str:
+    return _chat_completion_meta(cfg, messages, use_response_format,
+                                 max_tokens=max_tokens)[0]
 
 
 def call_ai(cfg: AppConfig, steps: List[Step]) -> dict:
@@ -468,9 +500,42 @@ def render_ai_html(html: str, steps: List[Step]) -> str:
     return out
 
 
+# Vòng lặp tiếp nối (agentic loop): một request thường KHÔNG đủ token để AI
+# viết xong cả trang HTML. Sau mỗi lượt, nếu phản hồi bị cắt (finish_reason
+# "length") hoặc tài liệu chưa đóng </html>, gửi tiếp yêu cầu "viết tiếp từ
+# chỗ dừng" kèm phần đã viết làm ngữ cảnh — lặp tới khi hoàn chỉnh.
+MAX_HTML_ROUNDS = 6
+
+_CONTINUE_PROMPT = (
+    "Phần HTML trên bị dừng giữa chừng. Hãy VIẾT TIẾP CHÍNH XÁC từ ký tự "
+    "cuối cùng ở trên: không lặp lại phần đã viết, không mở đầu bằng lời dẫn, "
+    "không dùng code fence, không bắt đầu lại tài liệu. Kết thúc bằng </html> "
+    "khi đã xong.")
+
+
+def merge_continuation(prev: str, nxt: str, min_overlap: int = 16,
+                       max_overlap: int = 400) -> str:
+    """Cắt đoạn trùng ở mối nối khi model lặp lại đuôi phần trước.
+
+    Trả về phần cần nối thêm vào prev. Chỉ cắt khi đoạn trùng đủ dài
+    (>= min_overlap) để không cắt nhầm trùng hợp ngẫu nhiên vài ký tự.
+    """
+    nxt = _strip_fences(nxt)
+    limit = min(len(prev), len(nxt), max_overlap)
+    for k in range(limit, min_overlap - 1, -1):
+        if prev.endswith(nxt[:k]):
+            return nxt[k:]
+    return nxt
+
+
 def call_ai_html(cfg: AppConfig, steps: List[Step],
-                 title: str = "", summary: str = "") -> str:
-    """Gọi AI tạo HTML trực quan; trả về HTML hoàn chỉnh đã gắn ảnh thật."""
+                 title: str = "", summary: str = "",
+                 on_progress=None) -> str:
+    """Gọi AI tạo HTML trực quan (nhiều lượt nếu cần); trả về HTML đã gắn ảnh.
+
+    on_progress(round_no, max_rounds): callback tiến độ vòng lặp (chạy trên
+    luồng worker — bên GUI tự marshal về luồng Tk).
+    """
     if not steps:
         raise RuntimeError("Không có bước nào để xử lý.")
     if not (cfg.base_url or "").strip():
@@ -478,14 +543,38 @@ def call_ai_html(cfg: AppConfig, steps: List[Step],
     if not (cfg.model or "").strip():
         raise RuntimeError("Chưa cấu hình Model.")
     messages = build_html_messages(steps, cfg, title=title, summary=summary)
+    html = ""
     try:
-        content = _chat_completion(cfg, messages, use_response_format=False,
-                                   max_tokens=8192)
+        for round_no in range(1, MAX_HTML_ROUNDS + 1):
+            if on_progress:
+                try:
+                    on_progress(round_no, MAX_HTML_ROUNDS)
+                except Exception:
+                    pass
+            content, finish = _chat_completion_meta(
+                cfg, messages, use_response_format=False, max_tokens=8192)
+            if html:
+                html += merge_continuation(html, content)
+            else:
+                html = _strip_fences(content)
+            if finish != "length" and "</html>" in html.lower():
+                break
+            log.info("AI HTML vòng %s/%s: chưa hoàn chỉnh (finish=%s), tiếp tục",
+                     round_no, MAX_HTML_ROUNDS, finish or "?")
+            messages.append({"role": "assistant", "content": content})
+            messages.append({"role": "user", "content": _CONTINUE_PROMPT})
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", "replace")
         raise RuntimeError(f"Lỗi API {e.code}: {body[:500]}")
     except urllib.error.URLError as e:
         raise RuntimeError(f"Lỗi kết nối: {e.reason}")
+    except RuntimeError:
+        raise
     except Exception as e:
         raise RuntimeError(f"Lỗi khi gọi AI: {e}")
-    return render_ai_html(extract_html(content), steps)
+    if "</html>" not in html.lower():
+        # hết vòng mà vẫn chưa đóng tài liệu -> tự vá để không mất phần đã có
+        log.warning("AI HTML: hết %s vòng vẫn chưa có </html>, tự đóng tài liệu",
+                    MAX_HTML_ROUNDS)
+        html += "\n</body></html>"
+    return render_ai_html(extract_html(html), steps)
