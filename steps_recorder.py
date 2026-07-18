@@ -1254,6 +1254,49 @@ class StepsRecorder:
             f.write(html)
         return path
 
+    def export_markdown(self, path: str, title: Optional[str] = None) -> str:
+        """Xuất Markdown; ảnh giải mã ra thư mục <tên file>_assets bên cạnh
+        (data-URI không hiển thị được trên GitHub)."""
+        title = title or self.report_title or "Bản ghi các bước"
+        base = os.path.splitext(os.path.basename(path))[0]
+        assets_dir = os.path.join(os.path.dirname(path) or ".", f"{base}_assets")
+
+        has_any_section = any((s.section or "").strip() for s in self.steps)
+        lines: List[str] = [f"# {title}", ""]
+        if self.report_summary.strip():
+            lines += [self.report_summary.strip(), ""]
+
+        wrote_assets = False
+        prev_section = None
+        for s in self.steps:
+            sec = (s.section or "").strip()
+            if not sec and has_any_section:
+                sec = "Các bước khác"
+            if sec and sec != prev_section:
+                lines += [f"## {sec}", ""]
+                prev_section = sec
+            lines.append(f"### Bước {s.index}: {s.action}")
+            if s.window and s.window != "(không xác định)":
+                lines.append(f"*Ứng dụng / cửa sổ: {s.window}*")
+            lines.append("")
+            if s.description.strip():
+                lines += [s.description.strip(), ""]
+            for j, b64 in enumerate(s.images):
+                if not wrote_assets:
+                    os.makedirs(assets_dir, exist_ok=True)
+                    wrote_assets = True
+                img_name = f"step_{s.index}_{j + 1}.png"
+                with open(os.path.join(assets_dir, img_name), "wb") as imf:
+                    imf.write(base64.b64decode(b64))
+                lines.append(
+                    f"![Minh họa bước {s.index}]({base}_assets/{img_name})")
+            if s.images:
+                lines.append("")
+
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines).rstrip() + "\n")
+        return path
+
 
 def _esc(text: str) -> str:
     return (str(text).replace("&", "&amp;").replace("<", "&lt;")
@@ -1773,6 +1816,8 @@ class ReviewWindow(tk.Toplevel):
             side="left", padx=2)
         _btn(right_bar, "💾 HTML", command=self._export, variant="primary").pack(
             side="left", padx=2)
+        _btn(right_bar, "📝 Markdown", command=self._export_md,
+             variant="secondary").pack(side="left", padx=2)
         _btn(right_bar, "⚙ Cấu hình", command=self.on_settings, variant="ghost").pack(
             side="left", padx=2)
         self.btn_undo = _btn(right_bar, "↩ Hoàn tác AI", command=self._undo_ai,
@@ -1977,6 +2022,29 @@ class ReviewWindow(tk.Toplevel):
             messagebox.showinfo(
                 "Steps Recorder",
                 f"Đã xuất HTML ({self.rec.step_count} bước):\n{path}", parent=self)
+
+    def _export_md(self):
+        self._sync_to_steps()
+        if self.rec.step_count == 0:
+            messagebox.showinfo("Steps Recorder", "Không còn bước nào để lưu.", parent=self)
+            return
+        default = f"steps_{dt.datetime.now():%Y%m%d_%H%M%S}.md"
+        path = filedialog.asksaveasfilename(
+            defaultextension=".md", initialfile=default,
+            filetypes=[("Markdown", "*.md")], parent=self)
+        if not path:
+            return
+        try:
+            saved = self.rec.export_markdown(path)
+        except Exception as e:
+            messagebox.showerror(
+                "Steps Recorder", f"Xuất Markdown thất bại:\n{e}", parent=self)
+            return
+        messagebox.showinfo(
+            "Steps Recorder",
+            f"Đã xuất Markdown ({self.rec.step_count} bước):\n{saved}\n\n"
+            "Lưu ý: ảnh nằm trong thư mục *_assets bên cạnh — khi chia sẻ hãy "
+            "gửi kèm thư mục này.", parent=self)
 
     # ---- lưu / mở dự án ----
     def _refresh_title_bar(self):
