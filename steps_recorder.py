@@ -114,6 +114,11 @@ PROJECT_FILETYPES = [
     ("JSON", "*.json"),
     ("Tất cả", "*.*"),
 ]
+CONFIG_FILETYPES = [
+    ("Cấu hình Steps Recorder", "*.config.json"),
+    ("JSON", "*.json"),
+    ("Tất cả", "*.*"),
+]
 
 
 # --- Cấu hình ứng dụng --------------------------------------------------------
@@ -165,17 +170,34 @@ class AppConfig:
     ai_merge_steps: bool = True       # cho AI gộp/bỏ bước
     export_toc: bool = True           # xuất HTML kèm mục lục
 
+    def to_dict(self, include_api_key: bool = True) -> dict:
+        data = asdict(self)
+        if not include_api_key:
+            data["api_key"] = ""
+        return data
+
+    def apply_dict(self, data: dict, keep_api_key_if_empty: bool = False):
+        if not isinstance(data, dict):
+            return
+        prev_key = self.api_key
+        for k, v in data.items():
+            if hasattr(self, k):  # bỏ qua khoá lạ (vd chrome_* của bản cũ)
+                setattr(self, k, v)
+        if keep_api_key_if_empty:
+            imported = (self.api_key or "").strip()
+            # Bỏ qua key trống / placeholder che (*** / REDACTED)
+            if not imported or imported in ("***", "REDACTED", "<redacted>"):
+                self.api_key = prev_key
+        if self.preset not in PRESETS:
+            self.preset = "Hướng dẫn sử dụng"
+
     @classmethod
     def load(cls) -> "AppConfig":
         try:
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
             cfg = cls()
-            for k, v in data.items():
-                if hasattr(cfg, k):     # bỏ qua khoá lạ (vd chrome_* của bản cũ)
-                    setattr(cfg, k, v)
-            if cfg.preset not in PRESETS:
-                cfg.preset = "Hướng dẫn sử dụng"
+            cfg.apply_dict(data)
             return cfg
         except Exception:
             return cls()
@@ -183,9 +205,27 @@ class AppConfig:
     def save(self):
         try:
             with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-                json.dump(asdict(self), f, ensure_ascii=False, indent=2)
+                json.dump(self.to_dict(include_api_key=True), f,
+                          ensure_ascii=False, indent=2)
         except Exception:
             pass
+
+    def export_to(self, path: str, include_api_key: bool = False) -> str:
+        """Xuất JSON chia sẻ. Mặc định KHÔNG ghi api_key (tránh lộ secret)."""
+        if not path.lower().endswith((".json", ".config.json")):
+            path = path + ".config.json"
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(self.to_dict(include_api_key=include_api_key), f,
+                      ensure_ascii=False, indent=2)
+        return path
+
+    def import_from(self, path: str):
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError("File cấu hình không hợp lệ.")
+        # Giữ key hiện tại nếu file xuất không có / đã che key
+        self.apply_dict(data, keep_api_key_if_empty=True)
 
 
 # --- Lớp AI (hàm thuần, tách khỏi GUI để dễ kiểm thử) ------------------------
@@ -557,6 +597,18 @@ class StepsRecorder:
             self._kbd_listener.stop()
             self._kbd_listener = None
 
+    def clear_session(self):
+        """Xoá phiên hiện tại (dừng ghi nếu đang ghi, reset bước/tiêu đề/dự án)."""
+        if self._recording:
+            self.stop()
+        self.steps.clear()
+        self.report_title = "Bản ghi các bước"
+        self.report_summary = ""
+        self.project_path = None
+        self._key_buffer.clear()
+        self._key_buffer_window = ""
+        self._last_key_time = 0.0
+
     # ---- Chỉnh sửa danh sách bước ----
     def delete_step(self, i: int):
         with self._lock:
@@ -678,8 +730,12 @@ class StepsRecorder:
         self._last_key_time = now
         try:
             ch = key.char
-            self._key_buffer.append(ch)
         except AttributeError:
+            ch = None
+        if ch is not None:
+            # key.char có thể là None (Ctrl+phím, phím đặc biệt vẫn có .char)
+            self._key_buffer.append(ch if isinstance(ch, str) else str(ch))
+        else:
             name = str(key).replace("Key.", "")
             if name == "space":
                 self._key_buffer.append(" ")
@@ -699,9 +755,10 @@ class StepsRecorder:
 
     def _flush_keys(self):
         if self._key_buffer:
-            text = "".join(self._key_buffer)
-            self._add_step(f'Nhập văn bản: "{text}"', None,
-                           self._key_buffer_window or self._active_window_title())
+            text = "".join(c for c in self._key_buffer if isinstance(c, str))
+            if text:
+                self._add_step(f'Nhập văn bản: "{text}"', None,
+                               self._key_buffer_window or self._active_window_title())
             self._key_buffer.clear()
             self._key_buffer_window = ""
 
@@ -1347,12 +1404,16 @@ class SettingsDialog(tk.Toplevel):
 
         bar = tk.Frame(wrap, bg=UITheme.BG)
         bar.pack(fill="x", pady=(4, 0))
+        _btn(bar, "Xuất cấu hình", command=self._export_config,
+             variant="ghost", width=14).pack(side="left")
+        _btn(bar, "Nhập cấu hình", command=self._import_config,
+             variant="ghost", width=14).pack(side="left", padx=(6, 0))
         _btn(bar, "Đóng", command=self.destroy, variant="ghost", width=10).pack(
             side="right", padx=(6, 0))
         _btn(bar, "Lưu cấu hình", command=self._save, variant="primary", width=14).pack(
             side="right")
 
-    def _save(self):
+    def _apply_form_to_config(self):
         c = self.config_obj
         c.base_url = self.var_base.get().strip() or "https://api.openai.com/v1"
         c.model = self.var_model.get().strip() or "gpt-4o-mini"
@@ -1362,11 +1423,176 @@ class SettingsDialog(tk.Toplevel):
         c.ai_merge_steps = bool(self.var_merge.get())
         c.preset = self.var_preset.get()
         c.custom_prompt = self.txt_prompt.get("1.0", "end").strip()
-        c.save()
+
+    def _load_form_from_config(self):
+        c = self.config_obj
+        self.var_base.set(c.base_url)
+        self.var_model.set(c.model)
+        self.var_key.set(c.api_key)
+        self.var_lang.set(c.out_language)
+        self.var_vision.set(bool(c.use_vision))
+        self.var_merge.set(bool(c.ai_merge_steps))
+        self.var_preset.set(c.preset if c.preset in PRESETS else "Hướng dẫn sử dụng")
+        self.txt_prompt.delete("1.0", "end")
+        self.txt_prompt.insert("1.0", c.custom_prompt or "")
+
+    def _export_config(self):
+        self._apply_form_to_config()
+        default = f"steps_recorder_{dt.datetime.now():%Y%m%d_%H%M%S}.config.json"
+        path = filedialog.asksaveasfilename(
+            defaultextension=".config.json", initialfile=default,
+            filetypes=CONFIG_FILETYPES, parent=self)
+        if not path:
+            return
+        include_key = False
+        if (self.config_obj.api_key or "").strip():
+            include_key = messagebox.askyesno(
+                "Cấu hình",
+                "Mặc định KHÔNG xuất API key (an toàn khi chia sẻ).\n\n"
+                "Bạn có muốn GỒM API key trong file không?\n"
+                "(Chỉ chọn Có nếu file chỉ dùng riêng, không gửi cho người khác.)",
+                parent=self)
+        try:
+            saved = self.config_obj.export_to(path, include_api_key=include_key)
+            note = " (có API key)" if include_key else " (đã ẩn API key)"
+            messagebox.showinfo(
+                "Cấu hình", f"Đã xuất cấu hình{note}:\n{saved}", parent=self)
+        except Exception as e:
+            messagebox.showerror("Cấu hình", f"Xuất cấu hình thất bại:\n{e}", parent=self)
+
+    def _import_config(self):
+        path = filedialog.askopenfilename(filetypes=CONFIG_FILETYPES, parent=self)
+        if not path:
+            return
+        try:
+            self.config_obj.import_from(path)
+            self._load_form_from_config()
+            messagebox.showinfo(
+                "Cấu hình",
+                "Đã nhập cấu hình vào form.\nBấm «Lưu cấu hình» để áp dụng lâu dài.",
+                parent=self)
+        except Exception as e:
+            messagebox.showerror("Cấu hình", f"Nhập cấu hình thất bại:\n{e}", parent=self)
+
+    def _save(self):
+        self._apply_form_to_config()
+        self.config_obj.save()
         if self.on_saved:
             self.on_saved()
         messagebox.showinfo("Cấu hình", "Đã lưu cấu hình.", parent=self)
         self.destroy()
+
+
+# --- Xem ảnh phóng to (cuộn + zoom) ------------------------------------------
+class ImageViewer(tk.Toplevel):
+    def __init__(self, parent, b64: str, title: str = "Xem ảnh"):
+        super().__init__(parent)
+        self.title(title)
+        self.configure(bg=UITheme.BG)
+        self.geometry("1000x720")
+        self.minsize(480, 360)
+        self.transient(parent)
+        try:
+            self.grab_set()
+        except Exception:
+            pass
+
+        self._pil = None
+        self._photo = None
+        self._zoom = 1.0
+        self._min_zoom = 0.1
+        self._max_zoom = 8.0
+
+        try:
+            self._pil = Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
+        except Exception as e:
+            messagebox.showerror("Xem ảnh", f"Không mở được ảnh:\n{e}", parent=parent)
+            self.destroy()
+            return
+
+        bar = tk.Frame(self, bg=UITheme.BG)
+        bar.pack(fill="x", padx=12, pady=(10, 6))
+        _btn(bar, "−", command=lambda: self._zoom_by(0.8), variant="ghost", width=4).pack(
+            side="left", padx=2)
+        _btn(bar, "+", command=lambda: self._zoom_by(1.25), variant="ghost", width=4).pack(
+            side="left", padx=2)
+        _btn(bar, "100%", command=self._zoom_100, variant="secondary", width=6).pack(
+            side="left", padx=2)
+        _btn(bar, "Vừa khung", command=self._zoom_fit, variant="secondary", width=10).pack(
+            side="left", padx=2)
+        self._zoom_lbl = tk.Label(bar, text="100%", bg=UITheme.BG, fg=UITheme.MUTED,
+                                  font=_ui_font(UITheme.FONT_SMALL))
+        self._zoom_lbl.pack(side="left", padx=10)
+        _btn(bar, "Đóng", command=self.destroy, variant="ghost", width=8).pack(side="right")
+
+        body = tk.Frame(self, bg=UITheme.SURFACE, highlightthickness=1,
+                        highlightbackground=UITheme.BORDER)
+        body.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        self.canvas = tk.Canvas(body, bg=UITheme.SURFACE_2, highlightthickness=0)
+        hsb = ttk.Scrollbar(body, orient="horizontal", command=self.canvas.xview)
+        vsb = ttk.Scrollbar(body, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(xscrollcommand=hsb.set, yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        hsb.pack(side="bottom", fill="x")
+        self.canvas.pack(side="left", fill="both", expand=True)
+
+        self.canvas.bind("<Configure>", lambda e: self._on_canvas_configure())
+        self.canvas.bind("<MouseWheel>", self._on_wheel)
+        self.canvas.bind("<Control-MouseWheel>", self._on_ctrl_wheel)
+        self.bind("<plus>", lambda e: self._zoom_by(1.25))
+        self.bind("<minus>", lambda e: self._zoom_by(0.8))
+        self.bind("<Escape>", lambda e: self.destroy())
+
+        self.after(50, self._zoom_fit)
+
+    def _on_canvas_configure(self):
+        if self._photo is None and self._pil is not None:
+            self._zoom_fit()
+
+    def _on_wheel(self, e):
+        if e.state & 0x4:  # Ctrl
+            self._on_ctrl_wheel(e)
+            return
+        self.canvas.yview_scroll(int(-e.delta / 120), "units")
+
+    def _on_ctrl_wheel(self, e):
+        self._zoom_by(1.25 if e.delta > 0 else 0.8)
+
+    def _zoom_by(self, factor: float):
+        self._set_zoom(self._zoom * factor)
+
+    def _zoom_100(self):
+        self._set_zoom(1.0)
+
+    def _zoom_fit(self):
+        if self._pil is None:
+            return
+        self.canvas.update_idletasks()
+        cw = max(self.canvas.winfo_width(), 1)
+        ch = max(self.canvas.winfo_height(), 1)
+        iw, ih = self._pil.size
+        if iw <= 0 or ih <= 0:
+            return
+        z = min(cw / iw, ch / ih) * 0.98
+        self._set_zoom(max(z, self._min_zoom))
+
+    def _set_zoom(self, z: float):
+        if self._pil is None or not _HAS_IMAGETK:
+            return
+        z = max(self._min_zoom, min(self._max_zoom, z))
+        self._zoom = z
+        iw, ih = self._pil.size
+        nw = max(1, int(iw * z))
+        nh = max(1, int(ih * z))
+        try:
+            resized = self._pil.resize((nw, nh), Image.Resampling.LANCZOS)
+        except Exception:
+            resized = self._pil.resize((nw, nh), Image.LANCZOS)
+        self._photo = ImageTk.PhotoImage(resized)
+        self.canvas.delete("all")
+        self.canvas.create_image(0, 0, anchor="nw", image=self._photo)
+        self.canvas.configure(scrollregion=(0, 0, nw, nh))
+        self._zoom_lbl.configure(text=f"{int(round(z * 100))}%")
 
 
 # --- Cửa sổ Xem lại & Chỉnh sửa ----------------------------------------------
@@ -1500,6 +1726,11 @@ class ReviewWindow(tk.Toplevel):
         except Exception:
             return None
 
+    def _open_image(self, b64, title: str = "Xem ảnh"):
+        if not b64:
+            return
+        ImageViewer(self, b64, title=title)
+
     def _render_steps(self):
         for w in self.list_frame.winfo_children():
             w.destroy()
@@ -1564,8 +1795,8 @@ class ReviewWindow(tk.Toplevel):
             if s.images:
                 strip = tk.Frame(card, bg=UITheme.SURFACE)
                 strip.pack(fill="x", padx=12, pady=(2, 12))
-                tk.Label(strip, text=f"Ảnh ({len(s.images)})", bg=UITheme.SURFACE,
-                         fg=UITheme.MUTED,
+                tk.Label(strip, text=f"Ảnh ({len(s.images)}) — nhấp để phóng to",
+                         bg=UITheme.SURFACE, fg=UITheme.MUTED,
                          font=_ui_font(UITheme.FONT_SMALL, "bold")).pack(
                     side="left", padx=(0, 8), anchor="n")
                 for j, b in enumerate(s.images):
@@ -1573,13 +1804,21 @@ class ReviewWindow(tk.Toplevel):
                                     highlightbackground=UITheme.BORDER)
                     cell.pack(side="left", padx=(0, 8), pady=2)
                     thumb = self._make_thumb(b)
+                    open_cmd = lambda b64=b, idx=s.index, sj=j: self._open_image(
+                        b64, f"Bước {idx} · ảnh {sj + 1}")
                     if thumb is not None:
-                        lbl = tk.Label(cell, image=thumb, bg=UITheme.SURFACE_2)
+                        lbl = tk.Label(cell, image=thumb, bg=UITheme.SURFACE_2,
+                                       cursor="hand2")
                         lbl.image = thumb
                         lbl.pack(padx=4, pady=4)
+                        lbl.bind("<Button-1>", lambda e, c=open_cmd: c())
                     else:
-                        tk.Label(cell, text="(ảnh)", bg=UITheme.SURFACE_2,
-                                 fg=UITheme.MUTED, width=12).pack(padx=4, pady=4)
+                        lbl = tk.Label(cell, text="(nhấp xem ảnh)", bg=UITheme.SURFACE_2,
+                                       fg=UITheme.BRAND, width=14, cursor="hand2")
+                        lbl.pack(padx=4, pady=4)
+                        lbl.bind("<Button-1>", lambda e, c=open_cmd: c())
+                    _btn(cell, "🔍 Phóng to", command=open_cmd,
+                         variant="ghost").pack(fill="x", padx=4, pady=(0, 2))
                     _btn(cell, "✕ Xóa ảnh",
                          command=lambda si=i, sj=j: self._remove_image(si, sj),
                          variant="danger").pack(fill="x", padx=4, pady=(0, 4))
@@ -1748,7 +1987,7 @@ class RecorderGUI:
 
         self.root = tk.Tk()
         self.root.title("Steps Recorder")
-        self.root.geometry("420x340")
+        self.root.geometry("420x400")
         self.root.resizable(False, False)
         self.root.attributes("-topmost", True)
         self.root.configure(bg=UITheme.BG)
@@ -1812,12 +2051,22 @@ class RecorderGUI:
 
         # Secondary actions
         bar2 = tk.Frame(body, bg=UITheme.BG)
-        bar2.pack(fill="x")
+        bar2.pack(fill="x", pady=(0, 6))
         bar2.columnconfigure((0, 1), weight=1)
+        _btn(bar2, "🆕  Ghi phiên mới", command=self.new_session,
+             variant="secondary").grid(row=0, column=0, sticky="ew", padx=(0, 4))
         _btn(bar2, "📂  Mở dự án", command=self.open_project,
-             variant="ghost").grid(row=0, column=0, sticky="ew", padx=(0, 4))
-        _btn(bar2, "⚙  Cấu hình", command=self.open_settings,
              variant="ghost").grid(row=0, column=1, sticky="ew", padx=(4, 0))
+
+        bar3 = tk.Frame(body, bg=UITheme.BG)
+        bar3.pack(fill="x")
+        bar3.columnconfigure((0, 1, 2), weight=1)
+        _btn(bar3, "⚙  Cấu hình", command=self.open_settings,
+             variant="ghost").grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        _btn(bar3, "⬆ Xuất cấu hình", command=self.export_config,
+             variant="ghost").grid(row=0, column=1, sticky="ew", padx=4)
+        _btn(bar3, "⬇ Nhập cấu hình", command=self.import_config,
+             variant="ghost").grid(row=0, column=2, sticky="ew", padx=(4, 0))
 
         tip = tk.Label(
             body,
@@ -1844,6 +2093,72 @@ class RecorderGUI:
     def open_settings(self):
         SettingsDialog(self.root, self.config)
 
+    def export_config(self):
+        default = f"steps_recorder_{dt.datetime.now():%Y%m%d_%H%M%S}.config.json"
+        path = filedialog.asksaveasfilename(
+            defaultextension=".config.json", initialfile=default,
+            filetypes=CONFIG_FILETYPES, parent=self.root)
+        if not path:
+            return
+        include_key = False
+        if (self.config.api_key or "").strip():
+            include_key = messagebox.askyesno(
+                "Cấu hình",
+                "Mặc định KHÔNG xuất API key (an toàn khi chia sẻ).\n\n"
+                "Bạn có muốn GỒM API key trong file không?\n"
+                "(Chỉ chọn Có nếu file chỉ dùng riêng, không gửi cho người khác.)")
+        try:
+            saved = self.config.export_to(path, include_api_key=include_key)
+            note = " (có API key)" if include_key else " (đã ẩn API key)"
+            messagebox.showinfo("Cấu hình", f"Đã xuất cấu hình{note}:\n{saved}")
+        except Exception as e:
+            messagebox.showerror("Cấu hình", f"Xuất cấu hình thất bại:\n{e}")
+
+    def import_config(self):
+        path = filedialog.askopenfilename(
+            filetypes=CONFIG_FILETYPES, parent=self.root)
+        if not path:
+            return
+        try:
+            self.config.import_from(path)
+            self.config.save()
+            messagebox.showinfo(
+                "Cấu hình",
+                f"Đã nhập và lưu cấu hình:\n{path}")
+        except Exception as e:
+            messagebox.showerror("Cấu hình", f"Nhập cấu hình thất bại:\n{e}")
+
+    def new_session(self):
+        if self.rec.is_recording:
+            if not messagebox.askyesno(
+                    "Ghi phiên mới",
+                    "Đang ghi. Dừng và xoá phiên hiện tại?"):
+                return
+        elif self.rec.step_count > 0:
+            if not messagebox.askyesno(
+                    "Ghi phiên mới",
+                    f"Phiên hiện có {self.rec.step_count} bước.\n"
+                    "Xoá hết và bắt đầu phiên mới?"):
+                return
+        self.rec.clear_session()
+        self._close_review()
+        self.status.set("Sẵn sàng")
+        self.count.set("0")
+        self._set_status_visual("idle")
+        self.btn_start.config(state="normal")
+        self.btn_pause.config(state="disabled", text="⏸  Tạm dừng")
+        self.btn_stop.config(state="disabled")
+
+    def _close_review(self):
+        if self._review is None:
+            return
+        try:
+            if self._review.winfo_exists():
+                self._review._close()
+        except Exception:
+            pass
+        self._review = None
+
     def open_project(self):
         if self.rec.is_recording:
             messagebox.showwarning(
@@ -1864,6 +2179,13 @@ class RecorderGUI:
         self._open_review()
 
     def start(self):
+        if self.rec.step_count > 0 and not self.rec.is_recording:
+            if not messagebox.askyesno(
+                    "Ghi",
+                    f"Bắt đầu ghi sẽ xoá {self.rec.step_count} bước hiện có.\n"
+                    "Tiếp tục?"):
+                return
+        self._close_review()
         self.rec.start()
         self.status.set("Đang ghi…")
         self.count.set("0")
