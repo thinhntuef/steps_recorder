@@ -1,0 +1,10 @@
+pynput>=1.7
+Pillow>=10.0
+mss>=9.0
+pygetwindow>=0.0.9
+
+# Đóng gói (tuỳ chọn):
+# pyinstaller>=6.0
+
+# Phát triển / kiểm thử:
+# pytest>=8.0
