@@ -2,11 +2,16 @@
 
 
 a = Analysis(
-    ['steps_recorder.py'],
+    ['main.py'],
     pathex=[],
     binaries=[],
     datas=[],
-    hiddenimports=[],
+    hiddenimports=[
+        # backend pynput/comtypes nạp động — PyInstaller không tự dò được
+        'pynput.keyboard._win32',
+        'pynput.mouse._win32',
+        'comtypes.stream',
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

@@ -1,0 +1,16 @@
+pynput>=1.7
+Pillow>=10.0
+mss>=9.0
+pygetwindow>=0.0.9
+python-docx>=1.1
+
+# Nhận diện phần tử UI được click (chỉ Windows):
+pywinauto>=0.6.8 ; sys_platform == "win32"
+
+# Đóng gói (tuỳ chọn):
+# pyinstaller>=6.0
+
+# Phát triển / kiểm thử:
+# pytest>=8.0
+# ruff>=0.4
+# mypy>=1.10
