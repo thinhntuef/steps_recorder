@@ -2,7 +2,8 @@ import json
 
 import pytest
 
-from steps_recorder import _normalize_ai, _strip_fences, parse_ai_content
+from steps_recorder import parse_ai_content
+from steps_recorder.ai import _normalize_ai, _strip_fences
 
 
 def test_strip_fences_plain_text():

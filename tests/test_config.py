@@ -2,13 +2,13 @@ import json
 import os
 import sys
 
-import steps_recorder
+import steps_recorder.config as config_mod
 from steps_recorder import AppConfig
 
 
 def _use_tmp_config(monkeypatch, tmp_path):
     path = str(tmp_path / "config.json")
-    monkeypatch.setattr(steps_recorder, "CONFIG_PATH", path)
+    monkeypatch.setattr(config_mod, "CONFIG_PATH", path)
     return path
 
 
@@ -24,7 +24,7 @@ def test_save_load_roundtrip(monkeypatch, tmp_path):
 
 
 def test_save_returns_false_on_unwritable_path(monkeypatch, tmp_path):
-    monkeypatch.setattr(steps_recorder, "CONFIG_PATH",
+    monkeypatch.setattr(config_mod, "CONFIG_PATH",
                         str(tmp_path / "no_such_dir" / "config.json"))
     assert AppConfig().save() is False
 
