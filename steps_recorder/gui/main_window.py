@@ -1,9 +1,13 @@
 """Cửa sổ điều khiển chính (Ghi / Tạm dừng / Dừng, phím tắt, cấu hình)."""
 import datetime as dt
 import logging
+import os
+import threading
 import tkinter as tk
+import webbrowser
 from tkinter import filedialog, messagebox
 
+from ..ai import apply_ai_result, call_ai
 from ..config import CONFIG_FILETYPES, CONFIG_PATH, AppConfig
 from ..deps import keyboard
 from ..models import PROJECT_FILETYPES, Step
@@ -23,7 +27,7 @@ class RecorderGUI:
 
         self.root = tk.Tk()
         self.root.title("Steps Recorder")
-        self.root.geometry("420x440")
+        self.root.geometry("420x470")
         self.root.resizable(False, False)
         self.root.attributes("-topmost", True)
         self.root.configure(bg=UITheme.BG)
@@ -113,6 +117,15 @@ class RecorderGUI:
             anchor="w",
         ).pack(fill="x", pady=(10, 0))
 
+        self.var_auto = tk.BooleanVar(value=bool(self.config.auto_process))
+        tk.Checkbutton(
+            body, text="🤖 Tự động: dừng ghi là AI biên soạn & xuất HTML",
+            variable=self.var_auto, command=self._toggle_auto,
+            bg=UITheme.BG, fg=UITheme.TEXT, activebackground=UITheme.BG,
+            selectcolor=UITheme.SURFACE, font=_ui_font(UITheme.FONT_SMALL),
+            anchor="w",
+        ).pack(fill="x", pady=(2, 0))
+
         tip = tk.Label(
             body,
             text="Phím tắt: F9 Ghi / Tạm dừng · F10 Dừng & sửa. "
@@ -154,6 +167,10 @@ class RecorderGUI:
     def _toggle_mask(self):
         self.config.mask_typed_text = bool(self.var_mask.get())
         self.rec.mask_typed_text = self.config.mask_typed_text
+        self.config.save()
+
+    def _toggle_auto(self):
+        self.config.auto_process = bool(self.var_auto.get())
         self.config.save()
 
     def open_settings(self):
@@ -288,6 +305,76 @@ class RecorderGUI:
         if self.rec.step_count == 0:
             messagebox.showinfo("Steps Recorder", "Chưa ghi được bước nào.")
             return
+        if self.config.auto_process:
+            self._auto_pipeline()
+        else:
+            self._open_review()
+
+    # ---- chế độ tự động: AI biên soạn & xuất ngay khi dừng ghi ----
+    def _auto_pipeline(self):
+        cfg = self.config
+        if not (cfg.base_url or "").strip() or not (cfg.model or "").strip():
+            messagebox.showwarning(
+                "AI", "Chế độ tự động cần cấu hình Base URL / Model (⚙ Cấu hình).\n"
+                      "Mở cửa sổ chỉnh sửa như bình thường.")
+            self._open_review()
+            return
+        self.status.set("🤖 AI đang biên soạn…")
+        self._set_status_visual("paused")
+        self.btn_start.config(state="disabled")
+
+        def worker():
+            try:
+                result = call_ai(cfg, list(self.rec.steps))
+                apply_ai_result(self.rec, result, merge=cfg.ai_merge_steps)
+                out_dir = self._auto_output_dir()
+                base = (self.rec.report_title or "huong_dan").strip()
+                safe = "".join(c if c.isalnum() or c in "._- " else "_"
+                               for c in base)[:40].strip() or "huong_dan"
+                stamp = f"{dt.datetime.now():%Y%m%d_%H%M%S}"
+                html = self.rec.export_html(
+                    os.path.join(out_dir, f"{safe}_{stamp}.html"),
+                    include_toc=cfg.export_toc)
+                proj = self.rec.save_project(
+                    os.path.join(out_dir, f"{safe}_{stamp}.steps.json"))
+                self.root.after(0, lambda: self._auto_done(html, proj))
+            except Exception as e:
+                log.exception("Chế độ tự động thất bại")
+                self.root.after(0, lambda err=e: self._auto_fail(err))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    @staticmethod
+    def _auto_output_dir() -> str:
+        docs = os.path.join(os.path.expanduser("~"), "Documents")
+        base = docs if os.path.isdir(docs) else os.path.expanduser("~")
+        out = os.path.join(base, "StepsRecorder")
+        os.makedirs(out, exist_ok=True)
+        return out
+
+    def _auto_done(self, html_path: str, proj_path: str):
+        self.btn_start.config(state="normal")
+        self.count.set(str(self.rec.step_count))
+        self.status.set("✅ AI đã biên soạn & xuất")
+        self._set_status_visual("stopped")
+        try:
+            webbrowser.open(f"file://{os.path.abspath(html_path)}")
+        except Exception:
+            pass
+        messagebox.showinfo(
+            "Steps Recorder",
+            "AI đã tự động biên soạn và xuất:\n\n"
+            f"HTML: {html_path}\n"
+            f"Dự án: {proj_path}\n\n"
+            "Cần chỉnh tay? Mở lại dự án bằng nút 📂 Mở dự án.")
+
+    def _auto_fail(self, err):
+        self.btn_start.config(state="normal")
+        self.status.set("Đã dừng")
+        self._set_status_visual("stopped")
+        messagebox.showerror(
+            "AI", f"Tự động biên soạn thất bại:\n{err}\n\n"
+                  "Mở cửa sổ chỉnh sửa để xử lý thủ công.")
         self._open_review()
 
     def _open_review(self):

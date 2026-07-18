@@ -12,6 +12,8 @@ Công cụ Python ghi lại thao tác người dùng (click chuột, phím gõ) 
 - Phím tắt toàn cục: **F9** Ghi / Tạm dừng / Tiếp tục, **F10** Dừng & sửa (không khả dụng trên Wayland; phím tắt không bị ghi thành bước).
 - Cửa sổ xem lại & chỉnh sửa sau khi ghi: xoá bước, xoá bớt ảnh, sửa nhãn/mô tả, sửa tiêu đề/tóm tắt trước khi xuất.
 - Trợ lý AI (tương thích OpenAI API / vLLM): biên soạn lại nhật ký thô thành hướng dẫn sử dụng (nhãn, mô tả, tiêu đề, tóm tắt), tự động chia phần mục lục, có thể gộp/bỏ bước dư thừa.
+- **Chế độ tự động 🤖**: bật checkbox ở cửa sổ chính là chỉ cần Ghi (F9) → thao tác → Dừng (F10); AI tự biên soạn, tự xuất HTML + lưu dự án vào `~/Documents/StepsRecorder/` và mở kết quả trong trình duyệt — không cần thao tác gì thêm. Nếu AI lỗi, ứng dụng quay về cửa sổ chỉnh sửa như thường.
+- **🎨 AI tạo HTML trực quan** (nút riêng, khác với xuất HTML template): AI tự thiết kế toàn bộ trang — bố cục, CSS, mục lục — theo nội dung từng bản ghi. Ảnh chụp không đi qua AI: AI chỉ chèn placeholder, ứng dụng gắn ảnh thật vào sau; ảnh nào AI không đặt sẽ gom vào "Phụ lục ảnh" để không mất dữ liệu.
 - Xuất báo cáo HTML tự chứa (ảnh nhúng base64), có mục lục theo phần và bước.
 - Xuất Markdown (`.md`) kèm thư mục ảnh `*_assets` — hiển thị được trên GitHub / VS Code; khi chia sẻ hãy gửi kèm thư mục ảnh.
 - Xuất tài liệu Word (`.docx`) với tiêu đề, phần, bước và ảnh nhúng — tiện chỉnh sửa tiếp trong Microsoft Word.

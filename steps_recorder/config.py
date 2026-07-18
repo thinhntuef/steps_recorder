@@ -61,6 +61,7 @@ class AppConfig:
     out_language: str = "Tiếng Việt"
     ai_merge_steps: bool = True       # cho AI gộp/bỏ bước
     export_toc: bool = True           # xuất HTML kèm mục lục
+    auto_process: bool = False        # dừng ghi là AI tự biên soạn & xuất HTML
 
     def to_dict(self, include_api_key: bool = True) -> dict:
         data = asdict(self)

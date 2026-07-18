@@ -4,6 +4,7 @@ Gọi API chat-completions tương thích OpenAI/vLLM qua urllib, phân tích JS
 trả về một cách bền vững và áp kết quả vào StepsRecorder.
 """
 import json
+import re
 import logging
 import urllib.error
 import urllib.request
@@ -133,14 +134,15 @@ def build_ai_messages(steps: List[Step], cfg: AppConfig) -> list:
     ]
 
 
-def _chat_completion(cfg: AppConfig, messages: list, use_response_format: bool) -> str:
+def _chat_completion(cfg: AppConfig, messages: list, use_response_format: bool,
+                     max_tokens: int = 4096) -> str:
     url = cfg.base_url.rstrip("/") + "/chat/completions"
     # temperature thấp + max_tokens rộng: phù hợp biên soạn tài liệu qua vLLM
     payload = {
         "model": cfg.model,
         "messages": messages,
         "temperature": 0.2,
-        "max_tokens": 4096,
+        "max_tokens": max_tokens,
     }
     if use_response_format:
         payload["response_format"] = {"type": "json_object"}
@@ -317,3 +319,173 @@ def apply_ai_result(recorder: "StepsRecorder", result: dict, merge: bool = False
     if result.get("summary"):
         recorder.report_summary = result["summary"]
 
+
+
+# --- AI tạo HTML trực quan ----------------------------------------------------
+# AI tự thiết kế toàn bộ file HTML (bố cục, CSS) thay vì dùng template cố định.
+# Ảnh không đi qua AI: AI chèn placeholder {{IMG_<bước>_<số ảnh>}}, ứng dụng
+# thay bằng ảnh base64 thật sau khi nhận HTML (render_ai_html).
+IMG_PLACEHOLDER_RE = re.compile(r"\{\{\s*IMG_(\d+)_(\d+)\s*\}\}")
+
+
+def _html_system_prompt(cfg: AppConfig) -> str:
+    preset_ctx = PRESETS.get(cfg.preset, "")
+    extra = (cfg.custom_prompt or "").strip()
+    parts = [
+        "Bạn là chuyên gia thiết kế tài liệu web. Nhiệm vụ: từ nhật ký thao tác "
+        "thô (danh sách bước + ảnh chụp màn hình), tạo MỘT file HTML hoàn chỉnh, "
+        "TỰ CHỨA, trình bày đẹp, hiện đại, dễ đọc.",
+        f"Ngôn ngữ nội dung: {cfg.out_language}.",
+        f"Bối cảnh tài liệu: {preset_ctx}" if preset_ctx else "",
+        f"Yêu cầu thêm từ người dùng: {extra}" if extra else "",
+        "",
+        "YÊU CẦU BẮT BUỘC:",
+        "- Trả về DUY NHẤT mã HTML (bắt đầu bằng <!DOCTYPE html>), không giải thích gì thêm.",
+        "- Toàn bộ CSS đặt trong một thẻ <style> nội tuyến. KHÔNG tải tài nguyên "
+        "ngoài (font, CDN, ảnh mạng), KHÔNG dùng JavaScript ngoài; JS nội tuyến "
+        "nhỏ (mục lục, cuộn) được phép.",
+        "- Viết lại các bước thành hướng dẫn rõ ràng: nhóm thành các phần hợp lý, "
+        "đặt tiêu đề tài liệu, đoạn tóm tắt mở đầu, mục lục liên kết tới từng phần.",
+        "- Gộp/bỏ bước trùng lặp, vô nghĩa; che thông tin nhạy cảm nếu thấy.",
+        "- VỊ TRÍ ẢNH: với mỗi ảnh minh hoạ, chèn đúng chuỗi placeholder dạng "
+        "{{IMG_3_1}} (ảnh 1 của bước gốc số 3) trên một dòng riêng tại vị trí phù "
+        "hợp. TUYỆT ĐỐI KHÔNG tự viết thẻ <img>, KHÔNG viết dữ liệu base64. "
+        "Chỉ dùng các placeholder có trong danh sách được cung cấp, mỗi cái một lần.",
+        "- Thiết kế: khoảng trắng thoáng, chữ dễ đọc, bước được đánh số nổi bật, "
+        "ảnh có khung/bo góc, in ấn tốt (print-friendly).",
+    ]
+    return "\n".join(p for p in parts if p)
+
+
+def build_html_messages(steps: List[Step], cfg: AppConfig,
+                        title: str = "", summary: str = "") -> list:
+    lines = ["=== NHẬT KÝ THÔ ==="]
+    if (title or "").strip():
+        lines.insert(0, f"Tiêu đề hiện có: {title.strip()}")
+    if (summary or "").strip():
+        lines.insert(1 if lines[0].startswith("Tiêu đề") else 0,
+                     f"Tóm tắt hiện có: {summary.strip()}")
+    placeholders = []
+    for s in steps:
+        lines.append(f"[{s.index}] {s.timestamp} | {s.action} | cửa sổ: {s.window}")
+        if s.description.strip():
+            lines.append(f"    ghi chú hiện có: {s.description.strip()}")
+        for j in range(1, len(s.images) + 1):
+            placeholders.append(f"{{{{IMG_{s.index}_{j}}}}}")
+    lines.append("=== HẾT NHẬT KÝ ===")
+    lines.append("")
+    if placeholders:
+        lines.append("Danh sách placeholder ảnh được phép dùng (mỗi cái một lần): "
+                     + ", ".join(placeholders))
+    else:
+        lines.append("Không có ảnh minh hoạ nào — không chèn placeholder.")
+    lines.append("Hãy tạo file HTML hoàn chỉnh theo yêu cầu trong system prompt.")
+    text_block = "\n".join(lines)
+
+    user_content: object
+    if cfg.use_vision:
+        content: List[dict] = [{"type": "text", "text": text_block}]
+        for s in steps:
+            for b in s.images:
+                content.append({"type": "text",
+                                "text": f"[Ảnh minh hoạ bước index {s.index}]"})
+                content.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{b}"},
+                })
+        user_content = content
+    else:
+        user_content = text_block
+
+    return [
+        {"role": "system", "content": _html_system_prompt(cfg)},
+        {"role": "user", "content": user_content},
+    ]
+
+
+def extract_html(text: str) -> str:
+    """Lấy tài liệu HTML từ phản hồi AI (chịu được ```fence``` và text thừa)."""
+    t = _strip_fences((text or "").strip())
+    low = t.lower()
+    for marker in ("<!doctype", "<html"):
+        pos = low.find(marker)
+        if pos != -1:
+            if pos > 0:
+                t = t[pos:]
+                low = t.lower()
+            break
+    if "<html" not in low and "<!doctype" not in low:
+        raise RuntimeError("Phản hồi AI không chứa tài liệu HTML hợp lệ.")
+    # cắt phần thừa sau </html> nếu có
+    end = low.rfind("</html>")
+    if end != -1:
+        t = t[:end + len("</html>")]
+    return t
+
+
+def render_ai_html(html: str, steps: List[Step]) -> str:
+    """Thay placeholder {{IMG_i_j}} bằng ảnh base64 thật.
+
+    Ảnh không được AI đặt vào đâu sẽ gom vào "Phụ lục ảnh" cuối trang để
+    không mất dữ liệu.
+    """
+    imgs = {}
+    for s in steps:
+        for j, b in enumerate(s.images, start=1):
+            imgs[(s.index, j)] = b
+    used = set()
+
+    def _sub(m):
+        key = (int(m.group(1)), int(m.group(2)))
+        b64 = imgs.get(key)
+        if b64 is None:
+            return ""  # placeholder AI bịa ra -> bỏ
+        used.add(key)
+        return (f'<img src="data:image/png;base64,{b64}" '
+                f'alt="Minh hoạ bước {key[0]}" '
+                'style="max-width:100%;height:auto;border-radius:8px;'
+                'box-shadow:0 2px 14px rgba(0,0,0,.18);margin:10px 0">')
+
+    out = IMG_PLACEHOLDER_RE.sub(_sub, html)
+
+    unused = sorted(k for k in imgs if k not in used)
+    if unused:
+        parts = ['<section style="max-width:960px;margin:40px auto;padding:0 16px">',
+                 '<h2>Phụ lục ảnh</h2>']
+        for (i, j) in unused:
+            parts.append(
+                '<figure style="margin:16px 0">'
+                f'<img src="data:image/png;base64,{imgs[(i, j)]}" '
+                f'alt="Bước {i}" style="max-width:100%;height:auto;'
+                'border-radius:8px;box-shadow:0 2px 14px rgba(0,0,0,.18)">'
+                f'<figcaption>Bước {i} · ảnh {j}</figcaption></figure>')
+        parts.append("</section>")
+        block = "\n".join(parts)
+        if "</body>" in out:
+            out = out.replace("</body>", block + "\n</body>", 1)
+        else:
+            out += "\n" + block
+    return out
+
+
+def call_ai_html(cfg: AppConfig, steps: List[Step],
+                 title: str = "", summary: str = "") -> str:
+    """Gọi AI tạo HTML trực quan; trả về HTML hoàn chỉnh đã gắn ảnh thật."""
+    if not steps:
+        raise RuntimeError("Không có bước nào để xử lý.")
+    if not (cfg.base_url or "").strip():
+        raise RuntimeError("Chưa cấu hình Base URL (endpoint) AI.")
+    if not (cfg.model or "").strip():
+        raise RuntimeError("Chưa cấu hình Model.")
+    messages = build_html_messages(steps, cfg, title=title, summary=summary)
+    try:
+        content = _chat_completion(cfg, messages, use_response_format=False,
+                                   max_tokens=8192)
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", "replace")
+        raise RuntimeError(f"Lỗi API {e.code}: {body[:500]}")
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Lỗi kết nối: {e.reason}")
+    except Exception as e:
+        raise RuntimeError(f"Lỗi khi gọi AI: {e}")
+    return render_ai_html(extract_html(content), steps)
