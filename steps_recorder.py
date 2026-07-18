@@ -3,18 +3,23 @@ Steps Recorder (bản Python) — ghi lại các bước thao tác của ngườ
 
 Mô phỏng công cụ "Steps Recorder / Problem Steps Recorder (PSR)" của Windows,
 có bổ sung:
-  - Lắng nghe click chuột và phím gõ, chụp màn hình khoanh tròn vị trí con trỏ.
-  - Gộp phím gõ liên tiếp thành một bước "Nhập văn bản".
+  - Lắng nghe click chuột và phím gõ, chụp màn hình khoanh tròn vị trí con trỏ
+    (chọn đúng màn hình chứa điểm click khi có nhiều màn hình).
+  - Nhận diện nhấp đúp; gộp phím gõ liên tiếp thành một bước "Nhập văn bản".
+  - Chế độ riêng tư (mặc định BẬT): che nội dung gõ phím (mật khẩu, dữ liệu
+    nhạy cảm) — không đi vào dự án, báo cáo hay tin nhắn gửi AI.
+  - Phím tắt toàn cục: F9 Ghi/Tạm dừng, F10 Dừng & sửa.
   - Cửa sổ XEM LẠI & CHỈNH SỬA sau khi ghi: xoá bước, xoá bớt ảnh, sửa nhãn/mô
     tả, sửa tiêu đề/tóm tắt trước khi xuất.
-   - Trợ lý AI (OpenAI-compatible / vLLM): biên soạn lại thành hướng dẫn sử
-     dụng chuyên nghiệp (nhãn, mô tả, tiêu đề, tóm tắt; chia phần mục lục;
-     tuỳ chọn gộp/bỏ bước).
-   - Xuất báo cáo HTML tự chứa (ảnh nhúng base64), mục lục theo phần + bước.
-   - Lưu / mở lại dự án (.steps.json) để tiếp tục chỉnh sửa sau.
- 
+  - Trợ lý AI (OpenAI-compatible / vLLM): biên soạn lại thành hướng dẫn sử
+    dụng chuyên nghiệp (nhãn, mô tả, tiêu đề, tóm tắt; chia phần mục lục;
+    tuỳ chọn gộp/bỏ bước).
+  - Xuất báo cáo HTML tự chứa (ảnh nhúng base64), mục lục theo phần + bước;
+    xuất Markdown kèm thư mục ảnh *_assets.
+  - Lưu / mở lại dự án (.steps.json) để tiếp tục chỉnh sửa sau.
+
  Cài đặt phụ thuộc:
-     pip install pynput pillow mss pygetwindow
+     pip install -r requirements.txt
  Tính năng AI gọi API qua urllib (thư viện chuẩn) nên KHÔNG cần cài thêm.
  
  Chạy:
