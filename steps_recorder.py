@@ -77,6 +77,10 @@ except Exception:
     # ImportError) — coi như không có, tính năng chỉ là tuỳ chọn.
     _HAS_GW = False
 
+# Phím tắt toàn cục của ứng dụng — không được ghi vào các bước
+HOTKEY_IGNORED_KEYS = (
+    {keyboard.Key.f9, keyboard.Key.f10} if keyboard is not None else set())
+
 
 # --- Cấu trúc một bước --------------------------------------------------------
 @dataclass
@@ -173,6 +177,7 @@ class AppConfig:
     model: str = "gpt-4o-mini"
     api_key: str = ""                 # WARNING: lưu PLAINTEXT trong file cấu hình ở home
     use_vision: bool = False
+    mask_typed_text: bool = True      # che nội dung gõ phím (mật khẩu…)
     preset: str = "Hướng dẫn sử dụng"
     custom_prompt: str = ""
     out_language: str = "Tiếng Việt"
@@ -552,6 +557,27 @@ def apply_ai_result(recorder: "StepsRecorder", result: dict, merge: bool = False
 
 
 # --- Bộ máy ghi ---------------------------------------------------------------
+MASKED_TEXT_ACTION = "Nhập văn bản (nội dung đã ẩn)"
+
+
+def format_typed_action(text: str, masked: bool) -> str:
+    """Nhãn cho bước gõ phím. masked=True: không lộ nội dung đã gõ."""
+    if masked:
+        return MASKED_TEXT_ACTION
+    return f'Nhập văn bản: "{text}"'
+
+
+def is_double_click(prev, now_t: float, x: int, y: int, button_name: str,
+                    max_dt: float = 0.4, max_dist: int = 8) -> bool:
+    """prev = (t, x, y, button_name) của click trước, hoặc None."""
+    if not prev:
+        return False
+    t0, x0, y0, btn0 = prev
+    return (btn0 == button_name
+            and 0 <= now_t - t0 <= max_dt
+            and max(abs(x - x0), abs(y - y0)) <= max_dist)
+
+
 def pick_monitor(monitors: list, x: int, y: int) -> dict:
     """Chọn màn hình chứa điểm (x, y) theo định dạng mss.
 
@@ -619,6 +645,7 @@ class StepsRecorder:
         self.report_title = "Bản ghi các bước"
         self.report_summary = ""
         self.project_path = None
+        self._last_click = None
         self._recording = True
         self._paused = False
         self._mouse_listener = mouse.Listener(on_click=self._on_click)
@@ -655,6 +682,7 @@ class StepsRecorder:
         self._key_buffer.clear()
         self._key_buffer_window = ""
         self._last_key_time = 0.0
+        self._last_click = None
 
     # ---- Chỉnh sửa danh sách bước ----
     def delete_step(self, i: int):
@@ -760,6 +788,20 @@ class StepsRecorder:
         self._flush_keys()  # đóng bước văn bản trước một cú click
         btn = {"Button.left": "trái", "Button.right": "phải",
                "Button.middle": "giữa"}.get(str(button), str(button))
+
+        # Nhấp đúp: nâng cấp bước click liền trước thay vì thêm bước mới.
+        # Điều kiện steps[-1] is prev_step bảo đảm không có bước nào chen giữa
+        # (vd _flush_keys ở trên vừa thêm một bước văn bản).
+        now = time.time()
+        prev = self._last_click
+        if (prev is not None
+                and is_double_click(prev[:4], now, x, y, str(button))):
+            with self._lock:
+                if self.steps and self.steps[-1] is prev[4]:
+                    prev[4].action = f"Nhấp đúp chuột {btn} tại ({x}, {y})"
+                    self._last_click = None  # nhấp lần 3 tính là chuỗi mới
+                    return
+
         window = self._active_window_title()
         try:
             img = self._grab_screen(x, y)
@@ -775,10 +817,13 @@ class StepsRecorder:
                 except Exception:
                     pass
         action = f"Nhấp chuột {btn} tại ({x}, {y})"
-        self._add_step(action, b64, window)
+        step = self._add_step(action, b64, window)
+        self._last_click = (now, x, y, str(button), step)
 
     # ---- Xử lý sự kiện bàn phím ----
     def _on_key(self, key):
+        if key in HOTKEY_IGNORED_KEYS:
+            return  # F9/F10 điều khiển ứng dụng, không phải thao tác cần ghi
         if not self._recording or self._paused:
             return
         now = time.time()
@@ -815,7 +860,10 @@ class StepsRecorder:
         if self._key_buffer:
             text = "".join(c for c in self._key_buffer if isinstance(c, str))
             if text:
-                self._add_step(f'Nhập văn bản: "{text}"', None,
+                # mask_typed_text: nội dung gốc bị loại bỏ ngay tại đây, không
+                # bao giờ đi vào Step / file dự án / HTML / tin nhắn gửi AI.
+                self._add_step(format_typed_action(text, self.mask_typed_text),
+                               None,
                                self._key_buffer_window or self._active_window_title())
             self._key_buffer.clear()
             self._key_buffer_window = ""
@@ -2051,7 +2099,7 @@ class RecorderGUI:
 
         self.root = tk.Tk()
         self.root.title("Steps Recorder")
-        self.root.geometry("420x400")
+        self.root.geometry("420x440")
         self.root.resizable(False, False)
         self.root.attributes("-topmost", True)
         self.root.configure(bg=UITheme.BG)
@@ -2132,16 +2180,40 @@ class RecorderGUI:
         _btn(bar3, "⬇ Nhập cấu hình", command=self.import_config,
              variant="ghost").grid(row=0, column=2, sticky="ew", padx=(4, 0))
 
+        self.var_mask = tk.BooleanVar(value=bool(self.config.mask_typed_text))
+        tk.Checkbutton(
+            body, text="🔒 Ẩn nội dung gõ phím (mật khẩu, dữ liệu nhạy cảm)",
+            variable=self.var_mask, command=self._toggle_mask,
+            bg=UITheme.BG, fg=UITheme.TEXT, activebackground=UITheme.BG,
+            selectcolor=UITheme.SURFACE, font=_ui_font(UITheme.FONT_SMALL),
+            anchor="w",
+        ).pack(fill="x", pady=(10, 0))
+
         tip = tk.Label(
             body,
-            text="Mẹo: cửa sổ luôn nổi trên cùng khi ghi. Dừng để chỉnh sửa & xuất.",
+            text="Phím tắt: F9 Ghi / Tạm dừng · F10 Dừng & sửa. "
+                 "Cửa sổ luôn nổi trên cùng khi ghi.",
             bg=UITheme.BG, fg=UITheme.MUTED, font=_ui_font(UITheme.FONT_SMALL),
             wraplength=380, justify="left",
         )
-        tip.pack(fill="x", pady=(14, 0))
+        tip.pack(fill="x", pady=(8, 0))
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.rec.on_error = self._on_rec_error
+
+        # Phím tắt toàn cục (không khả dụng trên Wayland -> bỏ qua nếu lỗi)
+        self._hotkeys = None
+        if keyboard is not None:
+            try:
+                self._hotkeys = keyboard.GlobalHotKeys({
+                    "<f9>": self._hk_toggle,
+                    "<f10>": self._hk_stop,
+                })
+                self._hotkeys.start()
+            except Exception:
+                self._hotkeys = None
+                log.warning("Không đăng ký được phím tắt toàn cục F9/F10",
+                            exc_info=True)
 
     def _set_status_visual(self, key: str):
         """Cập nhật màu chấm trạng thái theo trạng thái ghi."""
@@ -2154,6 +2226,11 @@ class RecorderGUI:
             "loaded": UITheme.BRAND,
         }
         self._dot.configure(fg=colors.get(key, UITheme.MUTED))
+
+    def _toggle_mask(self):
+        self.config.mask_typed_text = bool(self.var_mask.get())
+        self.rec.mask_typed_text = self.config.mask_typed_text
+        self.config.save()
 
     def open_settings(self):
         SettingsDialog(self.root, self.config)
@@ -2256,6 +2333,7 @@ class RecorderGUI:
                     "Tiếp tục?"):
                 return
         self._close_review()
+        self.rec.mask_typed_text = bool(self.config.mask_typed_text)
         self.rec.start()
         self.status.set("Đang ghi…")
         self.count.set("0")
@@ -2320,9 +2398,31 @@ class RecorderGUI:
     def _on_rec_error(self, msg: str):
         self.root.after(0, lambda: self.status.set(msg))
 
+    # ---- phím tắt toàn cục (chạy trong luồng pynput -> chuyển về luồng Tk) --
+    def _hk_toggle(self):
+        self.root.after(0, self._do_hk_toggle)
+
+    def _do_hk_toggle(self):
+        if self.rec.is_recording:
+            self.pause()
+        else:
+            self.start()
+
+    def _hk_stop(self):
+        self.root.after(0, self._do_hk_stop)
+
+    def _do_hk_stop(self):
+        if self.rec.is_recording:
+            self.stop()
+
     def _on_close(self):
         if self.rec.is_recording:
             self.rec.stop()
+        if self._hotkeys is not None:
+            try:
+                self._hotkeys.stop()
+            except Exception:
+                pass
         self.root.destroy()
 
     def run(self):
