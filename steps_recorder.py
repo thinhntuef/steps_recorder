@@ -25,6 +25,7 @@ có bổ sung:
 
 import base64
 import io
+import logging
 import os
 import copy
 import json
@@ -38,11 +39,17 @@ from tkinter import filedialog, messagebox, ttk
 from dataclasses import dataclass, field, asdict
 from typing import List, Optional
 
+log = logging.getLogger("steps_recorder")
+
 # --- Thư viện bên thứ ba (báo lỗi rõ ràng nếu thiếu) --------------------------
+# pynput có thể lỗi cả khi ĐÃ cài (vd không có X display trên Linux headless),
+# nên bắt Exception rộng và chỉ dừng hẳn khi chạy như ứng dụng (__main__).
 try:
     from pynput import mouse, keyboard
-except ImportError:
-    raise SystemExit("Thiếu 'pynput'. Cài bằng: pip install pynput")
+    _PYNPUT_ERROR: Optional[Exception] = None
+except Exception as _e:
+    mouse = keyboard = None  # type: ignore[assignment]
+    _PYNPUT_ERROR = _e
 
 try:
     from PIL import Image, ImageDraw
@@ -65,7 +72,9 @@ except ImportError:
 try:
     import pygetwindow as gw  # lấy tiêu đề cửa sổ active
     _HAS_GW = True
-except ImportError:
+except Exception:
+    # Trên Linux, import pygetwindow ném NotImplementedError (không phải
+    # ImportError) — coi như không có, tính năng chỉ là tuỳ chọn.
     _HAS_GW = False
 
 
@@ -199,16 +208,30 @@ class AppConfig:
             cfg = cls()
             cfg.apply_dict(data)
             return cfg
-        except Exception:
+        except FileNotFoundError:
+            return cls()  # lần chạy đầu — chưa có file, không cần báo
+        except Exception as e:
+            log.warning("File cấu hình hỏng, dùng mặc định (%s): %s",
+                        CONFIG_PATH, e)
             return cls()
 
-    def save(self):
+    def save(self) -> bool:
+        """Lưu cấu hình. Trả về False khi thất bại để nơi gọi cảnh báo."""
         try:
-            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            # Tạo file với quyền 0600 (chỉ chủ sở hữu đọc/ghi) vì có api_key.
+            fd = os.open(CONFIG_PATH,
+                         os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(self.to_dict(include_api_key=True), f,
                           ensure_ascii=False, indent=2)
+            try:
+                os.chmod(CONFIG_PATH, 0o600)  # siết lại file có sẵn từ bản cũ
+            except OSError:
+                pass
+            return True
         except Exception:
-            pass
+            log.exception("Không lưu được cấu hình %s", CONFIG_PATH)
+            return False
 
     def export_to(self, path: str, include_api_key: bool = False) -> str:
         """Xuất JSON chia sẻ. Mặc định KHÔNG ghi api_key (tránh lộ secret)."""
@@ -529,6 +552,20 @@ def apply_ai_result(recorder: "StepsRecorder", result: dict, merge: bool = False
 
 
 # --- Bộ máy ghi ---------------------------------------------------------------
+def pick_monitor(monitors: list, x: int, y: int) -> dict:
+    """Chọn màn hình chứa điểm (x, y) theo định dạng mss.
+
+    monitors: [0] là khung bao ảo toàn bộ, [1..] là từng màn hình thật.
+    Toạ độ âm (màn hình bên trái/phía trên màn chính) vẫn đúng nhờ phép so
+    sánh khoảng chứa. Không tìm thấy thì trả về màn hình chính.
+    """
+    for mon in monitors[1:]:
+        if (mon["left"] <= x < mon["left"] + mon["width"]
+                and mon["top"] <= y < mon["top"] + mon["height"]):
+            return mon
+    return monitors[1] if len(monitors) > 1 else monitors[0]
+
+
 class StepsRecorder:
     HIGHLIGHT_RADIUS = 28       # bán kính vòng khoanh vị trí click (px)
     HIGHLIGHT_WIDTH = 5         # độ dày viền vòng khoanh
@@ -550,6 +587,13 @@ class StepsRecorder:
         self._key_buffer_window = ""
         self._last_key_time = 0.0
         self.on_step_added = None   # callback(step) để cập nhật giao diện
+        self.on_error = None        # callback(msg) báo lỗi không chặn luồng ghi
+
+        # Che nội dung gõ phím (mật khẩu, dữ liệu nhạy cảm) — xem _flush_keys
+        self.mask_typed_text = True
+
+        # Nhận diện nhấp đúp: (t, x, y, button_str, step) của click gần nhất
+        self._last_click = None
 
     # ---- Trạng thái ----
     @property
@@ -568,6 +612,9 @@ class StepsRecorder:
     def start(self):
         if self._recording:
             return
+        if mouse is None or keyboard is None:
+            raise RuntimeError(
+                f"Không dùng được pynput để ghi thao tác: {_PYNPUT_ERROR}")
         self.steps.clear()
         self.report_title = "Bản ghi các bước"
         self.report_summary = ""
@@ -648,10 +695,14 @@ class StepsRecorder:
                 pass
         return "(không xác định)"
 
-    def _grab_screen(self) -> Image.Image:
+    def _grab_screen(self, x: Optional[int] = None,
+                     y: Optional[int] = None) -> Image.Image:
         if _HAS_MSS:
             with mss.mss() as sct:
-                mon = sct.monitors[1]  # màn hình chính
+                if x is not None and y is not None:
+                    mon = pick_monitor(sct.monitors, int(x), int(y))
+                else:
+                    mon = sct.monitors[1]  # màn hình chính
                 shot = sct.grab(mon)
                 img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
                 self._origin = (mon["left"], mon["top"])
@@ -699,7 +750,8 @@ class StepsRecorder:
             try:
                 self.on_step_added(step)
             except Exception:
-                pass
+                log.exception("Lỗi callback on_step_added")
+        return step
 
     # ---- Xử lý sự kiện chuột ----
     def _on_click(self, x, y, button, pressed):
@@ -710,12 +762,18 @@ class StepsRecorder:
                "Button.middle": "giữa"}.get(str(button), str(button))
         window = self._active_window_title()
         try:
-            img = self._grab_screen()
+            img = self._grab_screen(x, y)
             img = self._mark(img, x, y)
             b64 = self._to_b64(img)
         except Exception as e:
             b64 = None
             window += f"  [lỗi chụp màn hình: {e}]"
+            log.exception("Lỗi chụp màn hình tại (%s, %s)", x, y)
+            if self.on_error:
+                try:
+                    self.on_error("Lỗi chụp màn hình (bước vẫn được ghi)")
+                except Exception:
+                    pass
         action = f"Nhấp chuột {btn} tại ({x}, {y})"
         self._add_step(action, b64, window)
 
@@ -1476,10 +1534,16 @@ class SettingsDialog(tk.Toplevel):
 
     def _save(self):
         self._apply_form_to_config()
-        self.config_obj.save()
+        if not self.config_obj.save():
+            messagebox.showwarning(
+                "Cấu hình",
+                "KHÔNG lưu được file cấu hình:\n"
+                f"{CONFIG_PATH}\n\nCấu hình chỉ áp dụng cho phiên này.",
+                parent=self)
+        else:
+            messagebox.showinfo("Cấu hình", "Đã lưu cấu hình.", parent=self)
         if self.on_saved:
             self.on_saved()
-        messagebox.showinfo("Cấu hình", "Đã lưu cấu hình.", parent=self)
         self.destroy()
 
 
@@ -2077,6 +2141,7 @@ class RecorderGUI:
         tip.pack(fill="x", pady=(14, 0))
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.rec.on_error = self._on_rec_error
 
     def _set_status_visual(self, key: str):
         """Cập nhật màu chấm trạng thái theo trạng thái ghi."""
@@ -2121,10 +2186,15 @@ class RecorderGUI:
             return
         try:
             self.config.import_from(path)
-            self.config.save()
-            messagebox.showinfo(
-                "Cấu hình",
-                f"Đã nhập và lưu cấu hình:\n{path}")
+            if not self.config.save():
+                messagebox.showwarning(
+                    "Cấu hình",
+                    "Đã nhập cấu hình nhưng KHÔNG lưu được file:\n"
+                    f"{CONFIG_PATH}\n\nCấu hình chỉ áp dụng cho phiên này.")
+            else:
+                messagebox.showinfo(
+                    "Cấu hình",
+                    f"Đã nhập và lưu cấu hình:\n{path}")
         except Exception as e:
             messagebox.showerror("Cấu hình", f"Nhập cấu hình thất bại:\n{e}")
 
@@ -2244,7 +2314,11 @@ class RecorderGUI:
             win._refresh_title_bar()
 
     def _on_step_added(self, step: Step):
-        self.count.set(str(step.index))
+        # Chạy từ luồng listener của pynput -> chuyển về luồng Tk
+        self.root.after(0, lambda: self.count.set(str(step.index)))
+
+    def _on_rec_error(self, msg: str):
+        self.root.after(0, lambda: self.status.set(msg))
 
     def _on_close(self):
         if self.rec.is_recording:
@@ -2256,4 +2330,10 @@ class RecorderGUI:
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)s: %(message)s")
+    if _PYNPUT_ERROR is not None:
+        raise SystemExit(
+            "Thiếu hoặc không dùng được 'pynput'. Cài bằng: pip install pynput\n"
+            f"(Chi tiết: {_PYNPUT_ERROR})")
     RecorderGUI().run()
