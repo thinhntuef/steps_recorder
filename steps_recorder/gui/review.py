@@ -16,6 +16,7 @@ from ..config import AppConfig
 from ..deps import _HAS_IMAGETK, ImageTk
 from ..models import PROJECT_FILETYPES
 from ..recorder import StepsRecorder
+from .clarify import run_clarify_flow
 from .theme import (UITheme, _apply_ttk_theme, _btn, _section_card,
                     _style_entry, _style_text, _ui_font)
 from .viewer import ImageViewer
@@ -417,13 +418,19 @@ class ReviewWindow(tk.Toplevel):
         self._backup = (copy.deepcopy(self.rec.steps),
                         self.rec.report_title, self.rec.report_summary)
         self._merge_flag = bool(cfg.ai_merge_steps)
-        self.status.set("AI đang biên soạn hướng dẫn…")
         self._set_busy(True)
         steps_snapshot = list(self.rec.steps)
+        run_clarify_flow(
+            self, cfg, steps_snapshot, set_status=self.status.set,
+            on_done=lambda qa: self._compile_after_clarify(
+                cfg, steps_snapshot, qa))
+
+    def _compile_after_clarify(self, cfg, steps_snapshot, qa):
+        self.status.set("AI đang biên soạn hướng dẫn…")
 
         def worker():
             try:
-                result = call_ai(cfg, steps_snapshot)
+                result = call_ai(cfg, steps_snapshot, qa=qa)
                 self.after(0, lambda: self._ai_done(result))
             except Exception as e:
                 self.after(0, lambda err=e: self._ai_error(err))
@@ -465,9 +472,15 @@ class ReviewWindow(tk.Toplevel):
         if not self._check_ai_config() or self.rec.step_count == 0:
             return
         cfg = self.config_obj
-        self.status.set("🎨 AI đang thiết kế trang HTML…")
         self._set_busy(True)
         steps_snapshot = list(self.rec.steps)
+        run_clarify_flow(
+            self, cfg, steps_snapshot, set_status=self.status.set,
+            on_done=lambda qa: self._html_after_clarify(
+                cfg, steps_snapshot, qa))
+
+    def _html_after_clarify(self, cfg, steps_snapshot, qa):
+        self.status.set("🎨 AI đang thiết kế trang HTML…")
         title = self.rec.report_title
         summary = self.rec.report_summary
 
@@ -481,7 +494,7 @@ class ReviewWindow(tk.Toplevel):
             try:
                 html = call_ai_html(cfg, steps_snapshot,
                                     title=title, summary=summary,
-                                    on_progress=progress)
+                                    qa=qa, on_progress=progress)
                 self.after(0, lambda: self._ai_html_done(html))
             except Exception as e:
                 self.after(0, lambda err=e: self._ai_error(err))

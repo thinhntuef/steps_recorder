@@ -12,6 +12,7 @@ from ..config import CONFIG_FILETYPES, CONFIG_PATH, AppConfig
 from ..deps import keyboard
 from ..models import PROJECT_FILETYPES, Step
 from ..recorder import StepsRecorder
+from .clarify import run_clarify_flow
 from .review import ReviewWindow
 from .settings import SettingsDialog
 from .theme import UITheme, _apply_ttk_theme, _btn, _ui_font
@@ -319,13 +320,20 @@ class RecorderGUI:
                       "Mở cửa sổ chỉnh sửa như bình thường.")
             self._open_review()
             return
-        self.status.set("🤖 AI đang biên soạn…")
         self._set_status_visual("paused")
         self.btn_start.config(state="disabled")
+        steps_snapshot = list(self.rec.steps)
+        # Pha hỏi làm rõ (nếu bật): AI có thể hỏi lại vài câu trước khi soạn
+        run_clarify_flow(
+            self.root, cfg, steps_snapshot, set_status=self.status.set,
+            on_done=lambda qa: self._auto_compile(cfg, steps_snapshot, qa))
+
+    def _auto_compile(self, cfg, steps_snapshot, qa):
+        self.status.set("🤖 AI đang biên soạn…")
 
         def worker():
             try:
-                result = call_ai(cfg, list(self.rec.steps))
+                result = call_ai(cfg, steps_snapshot, qa=qa)
                 apply_ai_result(self.rec, result, merge=cfg.ai_merge_steps)
                 out_dir = self._auto_output_dir()
                 base = (self.rec.report_title or "huong_dan").strip()

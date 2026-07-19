@@ -92,8 +92,12 @@ def _system_prompt(cfg: AppConfig) -> str:
     return "\n".join(parts)
 
 
-def build_ai_messages(steps: List[Step], cfg: AppConfig) -> list:
-    """Dựng danh sách messages theo chuẩn OpenAI chat.completions (vLLM tương thích)."""
+def build_ai_messages(steps: List[Step], cfg: AppConfig,
+                      qa: Optional[List[tuple]] = None) -> list:
+    """Dựng danh sách messages theo chuẩn OpenAI chat.completions (vLLM tương thích).
+
+    qa: các cặp (câu hỏi, trả lời) từ pha hỏi làm rõ — đưa vào ngữ cảnh.
+    """
     lines = [
         "Dưới đây là nhật ký thao tác thô cần biên soạn lại thành tài liệu.",
         "Mỗi dòng: index | thời điểm | hành động thô | cửa sổ đang active.",
@@ -107,6 +111,9 @@ def build_ai_messages(steps: List[Step], cfg: AppConfig) -> list:
         if s.description.strip():
             lines.append(f"    ghi chú hiện có: {s.description.strip()}")
     lines.append("=== HẾT NHẬT KÝ ===")
+    qa_block = format_qa_block(qa or [])
+    if qa_block:
+        lines += ["", qa_block]
     lines.append("")
     lines.append(
         "Hãy biên soạn title, summary và danh sách steps theo đúng schema "
@@ -190,7 +197,8 @@ def _chat_completion(cfg: AppConfig, messages: list, use_response_format: bool,
                                  max_tokens=max_tokens)[0]
 
 
-def call_ai(cfg: AppConfig, steps: List[Step]) -> dict:
+def call_ai(cfg: AppConfig, steps: List[Step],
+            qa: Optional[List[tuple]] = None) -> dict:
     """Gọi API (OpenAI / vLLM) và trả về dict {title, summary, steps:[...]}."""
     if not steps:
         raise RuntimeError("Không có bước nào để xử lý.")
@@ -199,7 +207,7 @@ def call_ai(cfg: AppConfig, steps: List[Step]) -> dict:
     if not (cfg.model or "").strip():
         raise RuntimeError("Chưa cấu hình Model.")
     # API key có thể để trống với vLLM local; endpoint cloud vẫn nên có key
-    messages = build_ai_messages(steps, cfg)
+    messages = build_ai_messages(steps, cfg, qa=qa)
     try:
         content = _chat_completion(cfg, messages, True)
     except urllib.error.HTTPError as e:
@@ -390,7 +398,8 @@ def _html_system_prompt(cfg: AppConfig) -> str:
 
 
 def build_html_messages(steps: List[Step], cfg: AppConfig,
-                        title: str = "", summary: str = "") -> list:
+                        title: str = "", summary: str = "",
+                        qa: Optional[List[tuple]] = None) -> list:
     lines = ["=== NHẬT KÝ THÔ ==="]
     if (title or "").strip():
         lines.insert(0, f"Tiêu đề hiện có: {title.strip()}")
@@ -411,6 +420,9 @@ def build_html_messages(steps: List[Step], cfg: AppConfig,
                      + ", ".join(placeholders))
     else:
         lines.append("Không có ảnh minh hoạ nào — không chèn placeholder.")
+    qa_block = format_qa_block(qa or [])
+    if qa_block:
+        lines += [qa_block, ""]
     lines.append("Hãy tạo file HTML hoàn chỉnh theo yêu cầu trong system prompt.")
     text_block = "\n".join(lines)
 
@@ -530,6 +542,7 @@ def merge_continuation(prev: str, nxt: str, min_overlap: int = 16,
 
 def call_ai_html(cfg: AppConfig, steps: List[Step],
                  title: str = "", summary: str = "",
+                 qa: Optional[List[tuple]] = None,
                  on_progress=None) -> str:
     """Gọi AI tạo HTML trực quan (nhiều lượt nếu cần); trả về HTML đã gắn ảnh.
 
@@ -542,7 +555,8 @@ def call_ai_html(cfg: AppConfig, steps: List[Step],
         raise RuntimeError("Chưa cấu hình Base URL (endpoint) AI.")
     if not (cfg.model or "").strip():
         raise RuntimeError("Chưa cấu hình Model.")
-    messages = build_html_messages(steps, cfg, title=title, summary=summary)
+    messages = build_html_messages(steps, cfg, title=title, summary=summary,
+                                   qa=qa)
     html = ""
     try:
         for round_no in range(1, MAX_HTML_ROUNDS + 1):
@@ -578,3 +592,124 @@ def call_ai_html(cfg: AppConfig, steps: List[Step],
                     MAX_HTML_ROUNDS)
         html += "\n</body></html>"
     return render_ai_html(extract_html(html), steps)
+
+
+# --- Trợ lý hỏi làm rõ (clarifying questions) ---------------------------------
+# Trước khi biên soạn, AI được hỏi: "còn điểm gì chưa rõ không?". Nếu có,
+# ứng dụng hiện hộp thoại cho người dùng trả lời rồi đưa giải đáp vào ngữ
+# cảnh biên soạn — có thể lặp thêm một lượt nếu AI vẫn cần (giống cách một
+# trợ lý con người/Claude làm rõ yêu cầu trước khi bắt tay vào việc).
+MAX_CLARIFY_ROUNDS = 2
+MAX_QUESTIONS_PER_ROUND = 3
+
+
+def _clarify_system_prompt(cfg: AppConfig) -> str:
+    return "\n".join([
+        "Bạn là trợ lý biên soạn tài liệu hướng dẫn. Trước khi viết, hãy xem "
+        "nhật ký thao tác và các giải đáp đã có, rồi quyết định xem còn điểm "
+        "QUAN TRỌNG nào chưa rõ không (mục đích tài liệu, đối tượng đọc, ý "
+        "nghĩa của bước mơ hồ, tên hệ thống/thuật ngữ nội bộ, bước có vẻ thừa "
+        "hay là thao tác chủ đích…).",
+        f"CHỈ hỏi khi câu trả lời thực sự làm tài liệu tốt hơn. Tối đa "
+        f"{MAX_QUESTIONS_PER_ROUND} câu, ngắn gọn, dễ trả lời, bằng "
+        + (cfg.out_language or "Tiếng Việt") + ".",
+        "Kèm 2–4 gợi ý trả lời (suggestions) khi đoán được các khả năng.",
+        "Nếu mọi thứ đã đủ rõ để biên soạn tốt: trả về danh sách rỗng.",
+        'ĐỊNH DẠNG PHẢN HỒI: CHỈ một JSON: {"questions": '
+        '[{"question": string, "suggestions": [string]}]}',
+    ])
+
+
+def format_qa_block(qa: List[tuple]) -> str:
+    """Khối văn bản 'giải đáp từ người dùng' chèn vào ngữ cảnh biên soạn."""
+    if not qa:
+        return ""
+    lines = ["=== GIẢI ĐÁP LÀM RÕ TỪ NGƯỜI DÙNG (ưu tiên tuân theo) ==="]
+    for q, a in qa:
+        lines.append(f"Hỏi: {q}")
+        lines.append(f"Đáp: {a}")
+    lines.append("=== HẾT GIẢI ĐÁP ===")
+    return "\n".join(lines)
+
+
+def build_clarify_messages(steps: List[Step], cfg: AppConfig,
+                           qa: Optional[List[tuple]] = None) -> list:
+    lines = ["=== NHẬT KÝ THÔ ==="]
+    for s in steps:
+        lines.append(f"[{s.index}] {s.timestamp} | {s.action} | cửa sổ: {s.window}")
+        if s.description.strip():
+            lines.append(f"    ghi chú hiện có: {s.description.strip()}")
+    lines.append("=== HẾT NHẬT KÝ ===")
+    block = format_qa_block(qa or [])
+    if block:
+        lines += ["", block,
+                  "Dựa trên giải đáp trên, còn gì chưa rõ nữa không?"]
+    else:
+        lines += ["", "Còn điểm gì chưa rõ trước khi biên soạn không?"]
+    return [
+        {"role": "system", "content": _clarify_system_prompt(cfg)},
+        {"role": "user", "content": "\n".join(lines)},
+    ]
+
+
+def parse_questions(text: str) -> List[dict]:
+    """Đọc danh sách câu hỏi từ phản hồi AI; sai định dạng -> danh sách rỗng.
+
+    Pha hỏi chỉ là phụ trợ — không bao giờ để lỗi phân tích chặn việc chính.
+    """
+    raw = (text or "").strip()
+    obj = None
+    for cand in (raw, _strip_fences(raw)):
+        try:
+            obj = json.loads(cand)
+            break
+        except Exception:
+            continue
+    if obj is None:
+        start, end = raw.find("{"), raw.rfind("}")
+        if 0 <= start < end:
+            try:
+                obj = json.loads(raw[start:end + 1])
+            except Exception:
+                return []
+        else:
+            return []
+    items = obj.get("questions") if isinstance(obj, dict) else obj
+    if not isinstance(items, list):
+        return []
+    out = []
+    for it in items:
+        if isinstance(it, str):
+            it = {"question": it}
+        if not isinstance(it, dict):
+            continue
+        q = str(it.get("question") or it.get("q") or "").strip()
+        if not q:
+            continue
+        sugg = it.get("suggestions") or it.get("options") or []
+        if not isinstance(sugg, list):
+            sugg = []
+        out.append({"question": q,
+                    "suggestions": [str(s).strip() for s in sugg if str(s).strip()]})
+        if len(out) >= MAX_QUESTIONS_PER_ROUND:
+            break
+    return out
+
+
+def call_ai_questions(cfg: AppConfig, steps: List[Step],
+                      qa: Optional[List[tuple]] = None) -> List[dict]:
+    """Hỏi AI xem còn gì cần làm rõ; trả về [] nếu đủ rõ hoặc lỗi nhẹ."""
+    if not steps:
+        return []
+    messages = build_clarify_messages(steps, cfg, qa)
+    try:
+        content = _chat_completion(cfg, messages, use_response_format=True,
+                                   max_tokens=1024)
+    except urllib.error.HTTPError as e:
+        if e.code in (400, 404, 415, 422, 500, 501):
+            # endpoint không hỗ trợ response_format -> thử lại không ép JSON
+            content = _chat_completion(cfg, messages, use_response_format=False,
+                                       max_tokens=1024)
+        else:
+            raise
+    return parse_questions(content)
