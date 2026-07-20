@@ -60,7 +60,10 @@ class AppConfig:
     custom_prompt: str = ""
     out_language: str = "Tiếng Việt"
     ai_merge_steps: bool = True       # cho AI gộp/bỏ bước
+    ai_ask_questions: bool = True     # AI hỏi lại người dùng trước khi biên soạn
     export_toc: bool = True           # xuất HTML kèm mục lục
+    auto_process: bool = False        # dừng ghi là AI tự biên soạn & xuất HTML
+    request_timeout: int = 600        # giây chờ mỗi request AI (model chậm cần cao)
 
     def to_dict(self, include_api_key: bool = True) -> dict:
         data = asdict(self)

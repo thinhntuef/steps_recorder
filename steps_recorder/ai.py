@@ -4,6 +4,7 @@ Gọi API chat-completions tương thích OpenAI/vLLM qua urllib, phân tích JS
 trả về một cách bền vững và áp kết quả vào StepsRecorder.
 """
 import json
+import re
 import logging
 import urllib.error
 import urllib.request
@@ -91,8 +92,12 @@ def _system_prompt(cfg: AppConfig) -> str:
     return "\n".join(parts)
 
 
-def build_ai_messages(steps: List[Step], cfg: AppConfig) -> list:
-    """Dựng danh sách messages theo chuẩn OpenAI chat.completions (vLLM tương thích)."""
+def build_ai_messages(steps: List[Step], cfg: AppConfig,
+                      qa: Optional[List[tuple]] = None) -> list:
+    """Dựng danh sách messages theo chuẩn OpenAI chat.completions (vLLM tương thích).
+
+    qa: các cặp (câu hỏi, trả lời) từ pha hỏi làm rõ — đưa vào ngữ cảnh.
+    """
     lines = [
         "Dưới đây là nhật ký thao tác thô cần biên soạn lại thành tài liệu.",
         "Mỗi dòng: index | thời điểm | hành động thô | cửa sổ đang active.",
@@ -106,6 +111,9 @@ def build_ai_messages(steps: List[Step], cfg: AppConfig) -> list:
         if s.description.strip():
             lines.append(f"    ghi chú hiện có: {s.description.strip()}")
     lines.append("=== HẾT NHẬT KÝ ===")
+    qa_block = format_qa_block(qa or [])
+    if qa_block:
+        lines += ["", qa_block]
     lines.append("")
     lines.append(
         "Hãy biên soạn title, summary và danh sách steps theo đúng schema "
@@ -133,14 +141,28 @@ def build_ai_messages(steps: List[Step], cfg: AppConfig) -> list:
     ]
 
 
-def _chat_completion(cfg: AppConfig, messages: list, use_response_format: bool) -> str:
+def _request_timeout(cfg: AppConfig) -> int:
+    try:
+        t = int(cfg.request_timeout)
+    except (TypeError, ValueError):
+        t = 600
+    return max(30, t)
+
+
+def _chat_completion_meta(cfg: AppConfig, messages: list, use_response_format: bool,
+                          max_tokens: int = 4096) -> tuple:
+    """Gọi API, trả về (nội dung, finish_reason).
+
+    finish_reason == "length" nghĩa là phản hồi bị cắt vì chạm max_tokens —
+    tín hiệu để vòng lặp tiếp nối yêu cầu AI viết tiếp.
+    """
     url = cfg.base_url.rstrip("/") + "/chat/completions"
     # temperature thấp + max_tokens rộng: phù hợp biên soạn tài liệu qua vLLM
     payload = {
         "model": cfg.model,
         "messages": messages,
         "temperature": 0.2,
-        "max_tokens": 4096,
+        "max_tokens": max_tokens,
     }
     if use_response_format:
         payload["response_format"] = {"type": "json_object"}
@@ -150,13 +172,33 @@ def _chat_completion(cfg: AppConfig, messages: list, use_response_format: bool) 
     # vLLM thường chấp nhận key bất kỳ; vẫn gửi header cho endpoint tương thích OpenAI
     key = (cfg.api_key or "").strip() or "EMPTY"
     req.add_header("Authorization", f"Bearer {key}")
-    with urllib.request.urlopen(req, timeout=300) as resp:
-        raw = resp.read().decode("utf-8")
+    timeout = _request_timeout(cfg)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8")
+    except TimeoutError:
+        raise RuntimeError(
+            f"Hết thời gian chờ AI ({timeout}s). Tăng 'Timeout (giây)' trong "
+            "⚙ Cấu hình, hoặc dùng model nhanh hơn / tắt gửi ảnh (vision).")
+    except urllib.error.URLError as e:
+        if isinstance(getattr(e, "reason", None), TimeoutError):
+            raise RuntimeError(
+                f"Hết thời gian chờ AI ({timeout}s). Tăng 'Timeout (giây)' trong "
+                "⚙ Cấu hình, hoặc dùng model nhanh hơn / tắt gửi ảnh (vision).")
+        raise
     obj = json.loads(raw)
-    return obj["choices"][0]["message"]["content"]
+    choice = obj["choices"][0]
+    return choice["message"]["content"], (choice.get("finish_reason") or "")
 
 
-def call_ai(cfg: AppConfig, steps: List[Step]) -> dict:
+def _chat_completion(cfg: AppConfig, messages: list, use_response_format: bool,
+                     max_tokens: int = 4096) -> str:
+    return _chat_completion_meta(cfg, messages, use_response_format,
+                                 max_tokens=max_tokens)[0]
+
+
+def call_ai(cfg: AppConfig, steps: List[Step],
+            qa: Optional[List[tuple]] = None) -> dict:
     """Gọi API (OpenAI / vLLM) và trả về dict {title, summary, steps:[...]}."""
     if not steps:
         raise RuntimeError("Không có bước nào để xử lý.")
@@ -165,7 +207,7 @@ def call_ai(cfg: AppConfig, steps: List[Step]) -> dict:
     if not (cfg.model or "").strip():
         raise RuntimeError("Chưa cấu hình Model.")
     # API key có thể để trống với vLLM local; endpoint cloud vẫn nên có key
-    messages = build_ai_messages(steps, cfg)
+    messages = build_ai_messages(steps, cfg, qa=qa)
     try:
         content = _chat_completion(cfg, messages, True)
     except urllib.error.HTTPError as e:
@@ -317,3 +359,357 @@ def apply_ai_result(recorder: "StepsRecorder", result: dict, merge: bool = False
     if result.get("summary"):
         recorder.report_summary = result["summary"]
 
+
+
+# --- AI tạo HTML trực quan ----------------------------------------------------
+# AI tự thiết kế toàn bộ file HTML (bố cục, CSS) thay vì dùng template cố định.
+# Ảnh không đi qua AI: AI chèn placeholder {{IMG_<bước>_<số ảnh>}}, ứng dụng
+# thay bằng ảnh base64 thật sau khi nhận HTML (render_ai_html).
+IMG_PLACEHOLDER_RE = re.compile(r"\{\{\s*IMG_(\d+)_(\d+)\s*\}\}")
+
+
+def _html_system_prompt(cfg: AppConfig) -> str:
+    preset_ctx = PRESETS.get(cfg.preset, "")
+    extra = (cfg.custom_prompt or "").strip()
+    parts = [
+        "Bạn là chuyên gia thiết kế tài liệu web. Nhiệm vụ: từ nhật ký thao tác "
+        "thô (danh sách bước + ảnh chụp màn hình), tạo MỘT file HTML hoàn chỉnh, "
+        "TỰ CHỨA, trình bày đẹp, hiện đại, dễ đọc.",
+        f"Ngôn ngữ nội dung: {cfg.out_language}.",
+        f"Bối cảnh tài liệu: {preset_ctx}" if preset_ctx else "",
+        f"Yêu cầu thêm từ người dùng: {extra}" if extra else "",
+        "",
+        "YÊU CẦU BẮT BUỘC:",
+        "- Trả về DUY NHẤT mã HTML (bắt đầu bằng <!DOCTYPE html>), không giải thích gì thêm.",
+        "- Toàn bộ CSS đặt trong một thẻ <style> nội tuyến. KHÔNG tải tài nguyên "
+        "ngoài (font, CDN, ảnh mạng), KHÔNG dùng JavaScript ngoài; JS nội tuyến "
+        "nhỏ (mục lục, cuộn) được phép.",
+        "- Viết lại các bước thành hướng dẫn rõ ràng: nhóm thành các phần hợp lý, "
+        "đặt tiêu đề tài liệu, đoạn tóm tắt mở đầu, mục lục liên kết tới từng phần.",
+        "- Gộp/bỏ bước trùng lặp, vô nghĩa; che thông tin nhạy cảm nếu thấy.",
+        "- VỊ TRÍ ẢNH: với mỗi ảnh minh hoạ, chèn đúng chuỗi placeholder dạng "
+        "{{IMG_3_1}} (ảnh 1 của bước gốc số 3) trên một dòng riêng tại vị trí phù "
+        "hợp. TUYỆT ĐỐI KHÔNG tự viết thẻ <img>, KHÔNG viết dữ liệu base64. "
+        "Chỉ dùng các placeholder có trong danh sách được cung cấp, mỗi cái một lần.",
+        "- Thiết kế: khoảng trắng thoáng, chữ dễ đọc, bước được đánh số nổi bật, "
+        "ảnh có khung/bo góc, in ấn tốt (print-friendly).",
+    ]
+    return "\n".join(p for p in parts if p)
+
+
+def build_html_messages(steps: List[Step], cfg: AppConfig,
+                        title: str = "", summary: str = "",
+                        qa: Optional[List[tuple]] = None) -> list:
+    lines = ["=== NHẬT KÝ THÔ ==="]
+    if (title or "").strip():
+        lines.insert(0, f"Tiêu đề hiện có: {title.strip()}")
+    if (summary or "").strip():
+        lines.insert(1 if lines[0].startswith("Tiêu đề") else 0,
+                     f"Tóm tắt hiện có: {summary.strip()}")
+    placeholders = []
+    for s in steps:
+        lines.append(f"[{s.index}] {s.timestamp} | {s.action} | cửa sổ: {s.window}")
+        if s.description.strip():
+            lines.append(f"    ghi chú hiện có: {s.description.strip()}")
+        for j in range(1, len(s.images) + 1):
+            placeholders.append(f"{{{{IMG_{s.index}_{j}}}}}")
+    lines.append("=== HẾT NHẬT KÝ ===")
+    lines.append("")
+    if placeholders:
+        lines.append("Danh sách placeholder ảnh được phép dùng (mỗi cái một lần): "
+                     + ", ".join(placeholders))
+    else:
+        lines.append("Không có ảnh minh hoạ nào — không chèn placeholder.")
+    qa_block = format_qa_block(qa or [])
+    if qa_block:
+        lines += [qa_block, ""]
+    lines.append("Hãy tạo file HTML hoàn chỉnh theo yêu cầu trong system prompt.")
+    text_block = "\n".join(lines)
+
+    user_content: object
+    if cfg.use_vision:
+        content: List[dict] = [{"type": "text", "text": text_block}]
+        for s in steps:
+            for b in s.images:
+                content.append({"type": "text",
+                                "text": f"[Ảnh minh hoạ bước index {s.index}]"})
+                content.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{b}"},
+                })
+        user_content = content
+    else:
+        user_content = text_block
+
+    return [
+        {"role": "system", "content": _html_system_prompt(cfg)},
+        {"role": "user", "content": user_content},
+    ]
+
+
+def extract_html(text: str) -> str:
+    """Lấy tài liệu HTML từ phản hồi AI (chịu được ```fence``` và text thừa)."""
+    t = _strip_fences((text or "").strip())
+    low = t.lower()
+    for marker in ("<!doctype", "<html"):
+        pos = low.find(marker)
+        if pos != -1:
+            if pos > 0:
+                t = t[pos:]
+                low = t.lower()
+            break
+    if "<html" not in low and "<!doctype" not in low:
+        raise RuntimeError("Phản hồi AI không chứa tài liệu HTML hợp lệ.")
+    # cắt phần thừa sau </html> nếu có
+    end = low.rfind("</html>")
+    if end != -1:
+        t = t[:end + len("</html>")]
+    return t
+
+
+def render_ai_html(html: str, steps: List[Step]) -> str:
+    """Thay placeholder {{IMG_i_j}} bằng ảnh base64 thật.
+
+    Ảnh không được AI đặt vào đâu sẽ gom vào "Phụ lục ảnh" cuối trang để
+    không mất dữ liệu.
+    """
+    imgs = {}
+    for s in steps:
+        for j, b in enumerate(s.images, start=1):
+            imgs[(s.index, j)] = b
+    used = set()
+
+    def _sub(m):
+        key = (int(m.group(1)), int(m.group(2)))
+        b64 = imgs.get(key)
+        if b64 is None:
+            return ""  # placeholder AI bịa ra -> bỏ
+        used.add(key)
+        return (f'<img src="data:image/png;base64,{b64}" '
+                f'alt="Minh hoạ bước {key[0]}" '
+                'style="max-width:100%;height:auto;border-radius:8px;'
+                'box-shadow:0 2px 14px rgba(0,0,0,.18);margin:10px 0">')
+
+    out = IMG_PLACEHOLDER_RE.sub(_sub, html)
+
+    unused = sorted(k for k in imgs if k not in used)
+    if unused:
+        parts = ['<section style="max-width:960px;margin:40px auto;padding:0 16px">',
+                 '<h2>Phụ lục ảnh</h2>']
+        for (i, j) in unused:
+            parts.append(
+                '<figure style="margin:16px 0">'
+                f'<img src="data:image/png;base64,{imgs[(i, j)]}" '
+                f'alt="Bước {i}" style="max-width:100%;height:auto;'
+                'border-radius:8px;box-shadow:0 2px 14px rgba(0,0,0,.18)">'
+                f'<figcaption>Bước {i} · ảnh {j}</figcaption></figure>')
+        parts.append("</section>")
+        block = "\n".join(parts)
+        if "</body>" in out:
+            out = out.replace("</body>", block + "\n</body>", 1)
+        else:
+            out += "\n" + block
+    return out
+
+
+# Vòng lặp tiếp nối (agentic loop): một request thường KHÔNG đủ token để AI
+# viết xong cả trang HTML. Sau mỗi lượt, nếu phản hồi bị cắt (finish_reason
+# "length") hoặc tài liệu chưa đóng </html>, gửi tiếp yêu cầu "viết tiếp từ
+# chỗ dừng" kèm phần đã viết làm ngữ cảnh — lặp tới khi hoàn chỉnh.
+MAX_HTML_ROUNDS = 6
+
+_CONTINUE_PROMPT = (
+    "Phần HTML trên bị dừng giữa chừng. Hãy VIẾT TIẾP CHÍNH XÁC từ ký tự "
+    "cuối cùng ở trên: không lặp lại phần đã viết, không mở đầu bằng lời dẫn, "
+    "không dùng code fence, không bắt đầu lại tài liệu. Kết thúc bằng </html> "
+    "khi đã xong.")
+
+
+def merge_continuation(prev: str, nxt: str, min_overlap: int = 16,
+                       max_overlap: int = 400) -> str:
+    """Cắt đoạn trùng ở mối nối khi model lặp lại đuôi phần trước.
+
+    Trả về phần cần nối thêm vào prev. Chỉ cắt khi đoạn trùng đủ dài
+    (>= min_overlap) để không cắt nhầm trùng hợp ngẫu nhiên vài ký tự.
+    """
+    nxt = _strip_fences(nxt)
+    limit = min(len(prev), len(nxt), max_overlap)
+    for k in range(limit, min_overlap - 1, -1):
+        if prev.endswith(nxt[:k]):
+            return nxt[k:]
+    return nxt
+
+
+def call_ai_html(cfg: AppConfig, steps: List[Step],
+                 title: str = "", summary: str = "",
+                 qa: Optional[List[tuple]] = None,
+                 on_progress=None) -> str:
+    """Gọi AI tạo HTML trực quan (nhiều lượt nếu cần); trả về HTML đã gắn ảnh.
+
+    on_progress(round_no, max_rounds): callback tiến độ vòng lặp (chạy trên
+    luồng worker — bên GUI tự marshal về luồng Tk).
+    """
+    if not steps:
+        raise RuntimeError("Không có bước nào để xử lý.")
+    if not (cfg.base_url or "").strip():
+        raise RuntimeError("Chưa cấu hình Base URL (endpoint) AI.")
+    if not (cfg.model or "").strip():
+        raise RuntimeError("Chưa cấu hình Model.")
+    messages = build_html_messages(steps, cfg, title=title, summary=summary,
+                                   qa=qa)
+    html = ""
+    try:
+        for round_no in range(1, MAX_HTML_ROUNDS + 1):
+            if on_progress:
+                try:
+                    on_progress(round_no, MAX_HTML_ROUNDS)
+                except Exception:
+                    pass
+            content, finish = _chat_completion_meta(
+                cfg, messages, use_response_format=False, max_tokens=8192)
+            if html:
+                html += merge_continuation(html, content)
+            else:
+                html = _strip_fences(content)
+            if finish != "length" and "</html>" in html.lower():
+                break
+            log.info("AI HTML vòng %s/%s: chưa hoàn chỉnh (finish=%s), tiếp tục",
+                     round_no, MAX_HTML_ROUNDS, finish or "?")
+            messages.append({"role": "assistant", "content": content})
+            messages.append({"role": "user", "content": _CONTINUE_PROMPT})
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", "replace")
+        raise RuntimeError(f"Lỗi API {e.code}: {body[:500]}")
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Lỗi kết nối: {e.reason}")
+    except RuntimeError:
+        raise
+    except Exception as e:
+        raise RuntimeError(f"Lỗi khi gọi AI: {e}")
+    if "</html>" not in html.lower():
+        # hết vòng mà vẫn chưa đóng tài liệu -> tự vá để không mất phần đã có
+        log.warning("AI HTML: hết %s vòng vẫn chưa có </html>, tự đóng tài liệu",
+                    MAX_HTML_ROUNDS)
+        html += "\n</body></html>"
+    return render_ai_html(extract_html(html), steps)
+
+
+# --- Trợ lý hỏi làm rõ (clarifying questions) ---------------------------------
+# Trước khi biên soạn, AI được hỏi: "còn điểm gì chưa rõ không?". Nếu có,
+# ứng dụng hiện hộp thoại cho người dùng trả lời rồi đưa giải đáp vào ngữ
+# cảnh biên soạn — có thể lặp thêm một lượt nếu AI vẫn cần (giống cách một
+# trợ lý con người/Claude làm rõ yêu cầu trước khi bắt tay vào việc).
+MAX_CLARIFY_ROUNDS = 2
+MAX_QUESTIONS_PER_ROUND = 3
+
+
+def _clarify_system_prompt(cfg: AppConfig) -> str:
+    return "\n".join([
+        "Bạn là trợ lý biên soạn tài liệu hướng dẫn. Trước khi viết, hãy xem "
+        "nhật ký thao tác và các giải đáp đã có, rồi quyết định xem còn điểm "
+        "QUAN TRỌNG nào chưa rõ không (mục đích tài liệu, đối tượng đọc, ý "
+        "nghĩa của bước mơ hồ, tên hệ thống/thuật ngữ nội bộ, bước có vẻ thừa "
+        "hay là thao tác chủ đích…).",
+        f"CHỈ hỏi khi câu trả lời thực sự làm tài liệu tốt hơn. Tối đa "
+        f"{MAX_QUESTIONS_PER_ROUND} câu, ngắn gọn, dễ trả lời, bằng "
+        + (cfg.out_language or "Tiếng Việt") + ".",
+        "Kèm 2–4 gợi ý trả lời (suggestions) khi đoán được các khả năng.",
+        "Nếu mọi thứ đã đủ rõ để biên soạn tốt: trả về danh sách rỗng.",
+        'ĐỊNH DẠNG PHẢN HỒI: CHỈ một JSON: {"questions": '
+        '[{"question": string, "suggestions": [string]}]}',
+    ])
+
+
+def format_qa_block(qa: List[tuple]) -> str:
+    """Khối văn bản 'giải đáp từ người dùng' chèn vào ngữ cảnh biên soạn."""
+    if not qa:
+        return ""
+    lines = ["=== GIẢI ĐÁP LÀM RÕ TỪ NGƯỜI DÙNG (ưu tiên tuân theo) ==="]
+    for q, a in qa:
+        lines.append(f"Hỏi: {q}")
+        lines.append(f"Đáp: {a}")
+    lines.append("=== HẾT GIẢI ĐÁP ===")
+    return "\n".join(lines)
+
+
+def build_clarify_messages(steps: List[Step], cfg: AppConfig,
+                           qa: Optional[List[tuple]] = None) -> list:
+    lines = ["=== NHẬT KÝ THÔ ==="]
+    for s in steps:
+        lines.append(f"[{s.index}] {s.timestamp} | {s.action} | cửa sổ: {s.window}")
+        if s.description.strip():
+            lines.append(f"    ghi chú hiện có: {s.description.strip()}")
+    lines.append("=== HẾT NHẬT KÝ ===")
+    block = format_qa_block(qa or [])
+    if block:
+        lines += ["", block,
+                  "Dựa trên giải đáp trên, còn gì chưa rõ nữa không?"]
+    else:
+        lines += ["", "Còn điểm gì chưa rõ trước khi biên soạn không?"]
+    return [
+        {"role": "system", "content": _clarify_system_prompt(cfg)},
+        {"role": "user", "content": "\n".join(lines)},
+    ]
+
+
+def parse_questions(text: str) -> List[dict]:
+    """Đọc danh sách câu hỏi từ phản hồi AI; sai định dạng -> danh sách rỗng.
+
+    Pha hỏi chỉ là phụ trợ — không bao giờ để lỗi phân tích chặn việc chính.
+    """
+    raw = (text or "").strip()
+    obj = None
+    for cand in (raw, _strip_fences(raw)):
+        try:
+            obj = json.loads(cand)
+            break
+        except Exception:
+            continue
+    if obj is None:
+        start, end = raw.find("{"), raw.rfind("}")
+        if 0 <= start < end:
+            try:
+                obj = json.loads(raw[start:end + 1])
+            except Exception:
+                return []
+        else:
+            return []
+    items = obj.get("questions") if isinstance(obj, dict) else obj
+    if not isinstance(items, list):
+        return []
+    out = []
+    for it in items:
+        if isinstance(it, str):
+            it = {"question": it}
+        if not isinstance(it, dict):
+            continue
+        q = str(it.get("question") or it.get("q") or "").strip()
+        if not q:
+            continue
+        sugg = it.get("suggestions") or it.get("options") or []
+        if not isinstance(sugg, list):
+            sugg = []
+        out.append({"question": q,
+                    "suggestions": [str(s).strip() for s in sugg if str(s).strip()]})
+        if len(out) >= MAX_QUESTIONS_PER_ROUND:
+            break
+    return out
+
+
+def call_ai_questions(cfg: AppConfig, steps: List[Step],
+                      qa: Optional[List[tuple]] = None) -> List[dict]:
+    """Hỏi AI xem còn gì cần làm rõ; trả về [] nếu đủ rõ hoặc lỗi nhẹ."""
+    if not steps:
+        return []
+    messages = build_clarify_messages(steps, cfg, qa)
+    try:
+        content = _chat_completion(cfg, messages, use_response_format=True,
+                                   max_tokens=1024)
+    except urllib.error.HTTPError as e:
+        if e.code in (400, 404, 415, 422, 500, 501):
+            # endpoint không hỗ trợ response_format -> thử lại không ép JSON
+            content = _chat_completion(cfg, messages, use_response_format=False,
+                                       max_tokens=1024)
+        else:
+            raise
+    return parse_questions(content)

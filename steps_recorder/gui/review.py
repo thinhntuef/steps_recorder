@@ -6,15 +6,17 @@ import datetime as dt
 import os
 import threading
 import tkinter as tk
+import webbrowser
 from tkinter import filedialog, messagebox, ttk
 
 from PIL import Image
 
-from ..ai import apply_ai_result, call_ai
+from ..ai import apply_ai_result, call_ai, call_ai_html
 from ..config import AppConfig
 from ..deps import _HAS_IMAGETK, ImageTk
 from ..models import PROJECT_FILETYPES
 from ..recorder import StepsRecorder
+from .clarify import run_clarify_flow
 from .theme import (UITheme, _apply_ttk_theme, _btn, _section_card,
                     _style_entry, _style_text, _ui_font)
 from .viewer import ImageViewer
@@ -97,6 +99,9 @@ class ReviewWindow(tk.Toplevel):
         self.btn_ai = _btn(right_bar, "✨ AI biên soạn HDSD", command=self._run_ai,
                            variant="accent")
         self.btn_ai.pack(side="left", padx=(6, 0))
+        self.btn_ai_html = _btn(right_bar, "🎨 AI tạo HTML", command=self._run_ai_html,
+                                variant="accent")
+        self.btn_ai_html.pack(side="left", padx=(6, 0))
 
         # Danh sách bước (cuộn được)
         list_wrap = tk.Frame(self, bg=UITheme.BG)
@@ -389,10 +394,11 @@ class ReviewWindow(tk.Toplevel):
 
     # ---- xử lý AI (chạy nền) ----
     def _set_busy(self, busy: bool):
-        self.btn_ai.config(state="disabled" if busy else "normal")
+        state = "disabled" if busy else "normal"
+        self.btn_ai.config(state=state)
+        self.btn_ai_html.config(state=state)
 
-    def _run_ai(self):
-        self._sync_to_steps()
+    def _check_ai_config(self) -> bool:
         cfg = self.config_obj
         if not (cfg.base_url or "").strip() or not (cfg.model or "").strip():
             messagebox.showwarning(
@@ -400,20 +406,31 @@ class ReviewWindow(tk.Toplevel):
                 "Chưa cấu hình Base URL / Model.\n"
                 "Mở ⚙ Cấu hình (vLLM: http://host:8000/v1 + tên model).",
                 parent=self)
-            return
-        if self.rec.step_count == 0:
+            return False
+        return True
+
+    def _run_ai(self):
+        self._sync_to_steps()
+        cfg = self.config_obj
+        if not self._check_ai_config() or self.rec.step_count == 0:
             return
         # snapshot cho Hoàn tác
         self._backup = (copy.deepcopy(self.rec.steps),
                         self.rec.report_title, self.rec.report_summary)
         self._merge_flag = bool(cfg.ai_merge_steps)
-        self.status.set("AI đang biên soạn hướng dẫn…")
         self._set_busy(True)
         steps_snapshot = list(self.rec.steps)
+        run_clarify_flow(
+            self, cfg, steps_snapshot, set_status=self.status.set,
+            on_done=lambda qa: self._compile_after_clarify(
+                cfg, steps_snapshot, qa))
+
+    def _compile_after_clarify(self, cfg, steps_snapshot, qa):
+        self.status.set("AI đang biên soạn hướng dẫn…")
 
         def worker():
             try:
-                result = call_ai(cfg, steps_snapshot)
+                result = call_ai(cfg, steps_snapshot, qa=qa)
                 self.after(0, lambda: self._ai_done(result))
             except Exception as e:
                 self.after(0, lambda err=e: self._ai_error(err))
@@ -448,4 +465,63 @@ class ReviewWindow(tk.Toplevel):
         self._set_busy(False)
         self.status.set(f"{self.rec.step_count} bước")
         messagebox.showerror("AI", f"Xử lý AI thất bại:\n{err}", parent=self)
+
+    # ---- AI tạo HTML trực quan (chạy nền) ----
+    def _run_ai_html(self):
+        self._sync_to_steps()
+        if not self._check_ai_config() or self.rec.step_count == 0:
+            return
+        cfg = self.config_obj
+        self._set_busy(True)
+        steps_snapshot = list(self.rec.steps)
+        run_clarify_flow(
+            self, cfg, steps_snapshot, set_status=self.status.set,
+            on_done=lambda qa: self._html_after_clarify(
+                cfg, steps_snapshot, qa))
+
+    def _html_after_clarify(self, cfg, steps_snapshot, qa):
+        self.status.set("🎨 AI đang thiết kế trang HTML…")
+        title = self.rec.report_title
+        summary = self.rec.report_summary
+
+        def progress(round_no, max_rounds):
+            # chạy trên luồng worker -> chuyển về luồng Tk
+            msg = (f"🎨 AI đang thiết kế trang HTML… "
+                   f"(lượt {round_no}/{max_rounds})")
+            self.after(0, lambda: self.status.set(msg))
+
+        def worker():
+            try:
+                html = call_ai_html(cfg, steps_snapshot,
+                                    title=title, summary=summary,
+                                    qa=qa, on_progress=progress)
+                self.after(0, lambda: self._ai_html_done(html))
+            except Exception as e:
+                self.after(0, lambda err=e: self._ai_error(err))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _ai_html_done(self, html: str):
+        self._set_busy(False)
+        self.status.set(f"{self.rec.step_count} bước · AI đã tạo HTML")
+        default = f"steps_ai_{dt.datetime.now():%Y%m%d_%H%M%S}.html"
+        path = filedialog.asksaveasfilename(
+            defaultextension=".html", initialfile=default,
+            filetypes=[("HTML", "*.html")], parent=self)
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(html)
+        except Exception as e:
+            messagebox.showerror(
+                "Steps Recorder", f"Không lưu được file:\n{e}", parent=self)
+            return
+        try:
+            webbrowser.open(f"file://{os.path.abspath(path)}")
+        except Exception:
+            pass
+        messagebox.showinfo(
+            "Steps Recorder",
+            f"AI đã tạo trang HTML trực quan:\n{path}", parent=self)
 
